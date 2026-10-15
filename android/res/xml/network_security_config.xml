@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  允许明文 HTTP：方便接入局域网内的自建大模型服务
+  （例如 http://192.168.1.10:11434 Ollama / LM Studio / One-API）。
+  同时信任用户安装的证书，便于抓包调试。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

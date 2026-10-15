@@ -1,0 +1,24 @@
+# 换行与二进制文件
+* text=auto eol=lf
+
+# APK、图片、字体都是二进制，不要让 Git 去改
+*.apk   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.ttf   binary
+*.jar   binary
+*.zip   binary
+
+# 文档保持原样
+*.md    text
+*.ps1   text
+*.js    text
+*.css   text
+*.html  text
+*.java  text
+*.xml   text
+
+# 让 GitHub 统计语言时不要把网页层算成主要语言
+android/assets/www/js/*.js linguist-language=JavaScript

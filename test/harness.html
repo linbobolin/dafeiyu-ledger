@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>记账本 · 自动化测试</title>
+<link rel="stylesheet" href="../android/assets/www/css/app.css" />
+<style>
+  #report { position: fixed; inset: 0; z-index: 9999; background: #0b0d11;
+            color: #ddd; font: 12px/1.6 monospace; padding: 12px; overflow: auto; }
+  .pass { color: #3ddc97; }
+  .fail { color: #ff5c68; font-weight: bold; }
+  .sec  { color: #6cf; margin-top: 10px; }
+  pre { margin: 0; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+
+<div id="appbg" aria-hidden="true"></div>
+
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><span class="logo">💰</span><span>大肥鱼记账本</span></div>
+    <div class="spacer"></div>
+    <button class="icon-btn" data-act="openSettings">⚙️</button>
+  </header>
+  <main id="view"></main>
+  <div class="bulk-bar" id="bulkbar" hidden></div>
+  <nav class="tabbar" id="tabbar"></nav>
+</div>
+<div class="sheet-mask" id="sheet-mask" data-act="closeSheet"></div>
+<div class="sheet" id="sheet"></div>
+<div id="toast"></div>
+
+<script>
+  // 捕获所有运行期错误，供测试报告使用
+  window.__errors = [];
+  window.addEventListener('error', function (e) {
+    window.__errors.push((e.message || 'error') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    window.__errors.push('unhandled rejection: ' + (e.reason && e.reason.message ? e.reason.message : e.reason));
+  });
+
+  /* ----------------------------------------------------------------
+     模拟安卓原生桥。
+     这样 Store.HAS_NATIVE 为 true，原生分支（文件存储、图片、
+     桌面图标切换、待确认收付款收件箱）都能被真正测到。
+     ---------------------------------------------------------------- */
+  window.__nativeFiles = {};
+  window.__images = {};
+  window.__payInbox = [];
+  window.__launcherIcon = 'whale_q_blue';
+  window.__notifAccess = false;
+  window.__httpReply = '{"status":200,"body":"{}"}';
+
+  window.Android = {
+    fsReady: function () { return true; },
+    fsRead: function (f) {
+      return Object.prototype.hasOwnProperty.call(window.__nativeFiles, f)
+        ? window.__nativeFiles[f] : null;
+    },
+    fsWrite: function (f, c) { window.__nativeFiles[f] = c; return true; },
+    fsExists: function (f) { return Object.prototype.hasOwnProperty.call(window.__nativeFiles, f); },
+    fsDelete: function (f) { delete window.__nativeFiles[f]; return true; },
+    fsList: function () { return '[]'; },
+
+    saveImage: function (name, dataUrl) { window.__images[name] = dataUrl; return true; },
+    loadImage: function (name) {
+      return Object.prototype.hasOwnProperty.call(window.__images, name)
+        ? window.__images[name] : null;
+    },
+    deleteImage: function (name) { delete window.__images[name]; return true; },
+
+    httpRequest: function (method, url, headers, body) {
+      window.__lastHttp = {
+        method: method, url: url,
+        headers: (function () { try { return JSON.parse(headers || '{}'); } catch (e) { return {}; } })(),
+        body: body
+      };
+      return window.__httpReply;
+    },
+    copy: function () { return true; },
+    share: function () { return true; },
+    toast: function () {},
+    dataDir: function () { return '/data/test/ledger'; },
+
+    setLauncherIcon: function (k) { window.__launcherIcon = k; return true; },
+    getLauncherIcon: function () { return window.__launcherIcon; },
+
+    canPinCustomIcon: function () { return window.__canPin !== false; },
+    hasPinnedCustomIcon: function () { return !!window.__pinned; },
+    pinCustomIcon: function (dataUrl, label) {
+      window.__pinned = { dataUrl: dataUrl, label: label };
+      return window.__pinResult !== false;
+    },
+    loadCustomIcon: function () { return ''; },
+
+    hasPayAccess: function () { return window.__notifAccess; },
+    openPayAccessSettings: function () { return true; },
+    listPayInbox: function () { return JSON.stringify(window.__payInbox); },
+    removePayInbox: function (idsJson) {
+      var ids = JSON.parse(idsJson);
+      window.__payInbox = window.__payInbox.filter(function (p) {
+        return ids.indexOf(p.id) < 0;
+      });
+      return true;
+    },
+    clearPayInbox: function () { window.__payInbox = []; return true; },
+    injectTestPay: function (src, type, amt, content) {
+      window.__payInbox.push({
+        id: 'inj' + window.__payInbox.length, ts: Date.now(),
+        source: src, type: type, amount: amt, content: content, raw: '[inject]'
+      });
+      return true;
+    },
+    testPayParse: function (pkg, title, body) {
+      // 模拟原生 PayParser 的行为，够用来验证自检面板的交互
+      var all = String(title || '') + ' ' + String(body || '');
+      var m = /[¥￥]\s*([\d,]+(?:\.\d{1,2})?)/.exec(all);
+      if (!m) return '{"ok":false}';
+      var amt = parseFloat(m[1].replace(/,/g, ''));
+      var isIncome = /收款到账|已到账|到账|退款/.test(all);
+      return JSON.stringify({
+        ok: true,
+        source: pkg === 'com.tencent.mm' ? '微信' : '支付宝',
+        type: isIncome ? 'income' : 'expense',
+        amount: amt,
+        content: '微信付款'
+      });
+    }
+  };
+</script>
+
+<script src="../android/assets/www/js/theme.js"></script>
+<script src="../android/assets/www/js/classify.js"></script>
+<script src="../android/assets/www/js/charts.js"></script>
+<script src="../android/assets/www/js/store.js"></script>
+<script src="../android/assets/www/js/calendar.js"></script>
+<script src="../android/assets/www/js/ai.js"></script>
+<script src="../android/assets/www/js/import.js"></script>
+<script src="../android/assets/www/js/app.js"></script>
+
+<script>
+(function () {
+  var out = [];
+  var pass = 0, fail = 0;
+  var currentSection = '(尚未开始)';
+
+  function log(html) { out.push(html); }
+  function sec(t) { currentSection = t; log('<div class="sec">── ' + t + ' ──</div>'); }
+
+  /** 安全点击：找不到元素时记为失败而不是抛异常中断整轮测试 */
+  function clickEl(sel, name) {
+    var el = document.querySelector(sel);
+    if (!el) {
+      ok(false, name || ('点击 ' + sel), '找不到元素');
+      return false;
+    }
+    el.click();
+    return true;
+  }
+
+  function ok(cond, name, extra) {
+    if (cond) { pass++; log('<div class="pass">✓ ' + name + (extra ? '  <span style="color:#888">' + extra + '</span>' : '') + '</div>'); }
+    else { fail++; log('<div class="fail">✗ ' + name + (extra ? '  → ' + extra : '') + '</div>'); }
+  }
+  function eq(a, b, name) { ok(String(a) === String(b), name, 'got=' + JSON.stringify(a) + ' want=' + JSON.stringify(b)); }
+
+  function run() {
+    // ---------------- 自动分类 ----------------
+    sec('自动分类归档识别');
+    var cases = [
+      ['公司楼下快餐', '餐饮食物'],
+      ['星巴克拿铁', '餐饮食物'],
+      ['淘宝买衣服', '购物消费'],
+      ['地铁通勤', '交通出行'],
+      ['房租', '居住住房'],
+      ['电影票', '娱乐休闲'],
+      ['洗发水', '生活用品'],
+      ['药店买感冒药', '医疗健康'],
+      ['充话费', '通讯网络'],
+      ['买书', '学习成长'],
+      ['给妈妈的红包', '人情往来'],
+      ['猫粮', '宠物'],
+      ['京东买显示器', '数码电器'],
+      ['京东买纸巾', '生活用品'],
+      ['淘宝买衣服', '购物消费'],
+      ['火锅', '餐饮食物'],
+      ['理发', '服饰美容'],
+      ['酒店住宿', '旅行'],
+      ['某个不知道是什么的东西', '其他']
+    ];
+    cases.forEach(function (c) {
+      var r = Classify.classify(c[0], '');
+      eq(r.category.name, c[1], '「' + c[0] + '」→ ' + c[1]);
+    });
+
+    // 备注参与识别
+    var rn = Classify.classify('某某', '和朋友吃火锅');
+    eq(rn.category.name, '餐饮食物', '备注命中「火锅」→ 餐饮食物');
+
+    // ---------------- 文本记录格式 ----------------
+    sec('文本记录格式 时间 | 分类 | 内容 | 金额');
+    Store.clearAll(false);
+    Store.addRecord({ date: '2025-03-05', time: '12:30', amount: 25, content: '公司楼下快餐', category: 'food', note: '加了鸡腿' });
+    Store.addRecord({ date: '2025-03-05', time: '20:11', amount: 103.5, content: '京东买纸巾', category: 'daily', note: '' });
+    var recs = Store.query({});
+    var text = Store.toText(recs, { includeNote: false });
+    var lines = text.split('\n');
+    eq(lines.length, 2, '生成 2 行记录');
+    eq(lines[0], '2025-03-05 12:30 | 餐饮食物 | 公司楼下快餐 | -25.00', '第一行格式正确（支出为负）');
+    eq(lines[1], '2025-03-05 20:11 | 生活用品 | 京东买纸巾 | -103.50', '第二行格式（两位小数）正确');
+    ok(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \| .+ \| .+ \| [+-]\d+\.\d{2}$/.test(lines[0]),
+       '整体符合正则模板');
+    var withNote = Store.toText(recs, { includeNote: true });
+    ok(withNote.indexOf('备注：加了鸡腿') > 0, '可附加备注字段');
+    ok(withNote.indexOf('【') < 0, '不再出现【】符号');
+
+    // ---------------- 统计 ----------------
+    sec('统计与汇总');
+    var cats = Store.categoryTotals(recs);
+    eq(cats.length, 2, '两个分类');
+    eq(cats[0].name, '生活用品', '按金额降序（生活用品最大）');
+    eq(cats[0].value, 103.5, '生活用品合计 103.5');
+    eq(Store.sumAmount(recs), 128.5, '总支出 128.5');
+    var days = Store.dailyTotals(recs, '2025-03-01', '2025-03-07');
+    eq(days.length, 7, '补齐 7 天日期轴');
+    eq(days[4].value, 128.5, '3-05 当天合计正确');
+    eq(days[0].value, 0, '无记录的日子补 0');
+
+    // ---------------- 预算 / 当日剩余额度 ----------------
+    sec('预算与当日剩余额度');
+    var fixed = new Date(2025, 2, 15);           // 2025-03-15
+    Store.clearAll(false);
+    Store.saveSettings({ monthlyBudget: 3000, dailyBudget: 100, monthStartDay: 1 });
+    Store.addRecord({ date: '2025-03-01', time: '10:00', amount: 500, content: 'a', category: 'other' });
+    Store.addRecord({ date: '2025-03-15', time: '10:00', amount: 40, content: 'b', category: 'other' });
+    var b = Store.budget(fixed);
+    eq(b.period.totalDays, 31, '3 月共 31 天');
+    eq(b.period.elapsedDays, 15, '已过 15 天');
+    eq(b.period.remainingDays, 17, '剩余 17 天（含今日）');
+    eq(b.spentPeriod, 540, '本账期已花 540');
+    eq(b.spentToday, 40, '今日已花 40');
+    eq(b.spentBeforeToday, 500, '今日之前已花 500');
+    eq(b.remaining, 2460, '本账期剩余 2460');
+    eq(b.dailyAllowance, Math.round((3000 - 500) / 17 * 100) / 100, '月度平均日可用 = (3000-500)/17');
+    eq(b.todayRemaining, Math.round((b.dailyAllowance - 40) * 100) / 100, '今日剩余 = 日均可用 - 今日已花');
+    eq(b.todayRemainingByDay, 60, '按日额度剩余 = 100 - 40');
+
+    // 自定义账期起始日
+    var p15 = Store.periodOf(new Date(2025, 2, 20), 15);
+    eq(p15.startStr, '2025-03-15', '发薪日 15 号：账期 3-15 开始');
+    var p15b = Store.periodOf(new Date(2025, 2, 3), 15);
+    eq(p15b.startStr, '2025-02-15', '3 号仍属于 2-15 开始的账期');
+
+    // ---------------- 分组 ----------------
+    sec('明细分组');
+    var groups = Store.groupByDay(Store.query({ from: '2025-03-01', to: '2025-03-31' }));
+    eq(groups.length, 2, '两个日期分组');
+    eq(groups[0].date, '2025-03-15', '最新日期在前');
+    eq(groups[0].total, 40, '分组金额正确');
+
+    // ---------------- 图表 ----------------
+    sec('Canvas 图表渲染');
+    var cv = document.createElement('canvas');
+    cv.width = 300; cv.height = 200;
+    document.body.appendChild(cv);
+    var chartErr = null;
+    try {
+      Charts.donut(cv, Store.categoryTotals(recs), { height: 200 });
+      Charts.bars(cv, Store.dailyTotals(recs, '2025-03-01', '2025-03-07'), { height: 200 });
+      Charts.line(cv, Store.dailyTotals(recs, '2025-03-01', '2025-03-07'), { height: 200 });
+      Charts.donut(cv, [], { height: 200 });
+      Charts.bars(cv, [], { height: 200 });
+    } catch (e) { chartErr = e.message; }
+    ok(!chartErr, '三种图表 + 空数据均不抛异常', chartErr || '');
+
+    // ---------------- 目标 ----------------
+    sec('省钱目标');
+    Store.clearAll(false);
+    var g = Store.addGoal({ title: '买相机', target: 10000, saved: 2500, text: '每月存 1500', deadline: '2025-12-31' });
+    eq(Store.goals().length, 1, '创建目标成功');
+    eq(Store.getGoal(g.id).target, 10000, '目标金额正确');
+    Store.depositGoal(g.id, 500);
+    eq(Store.getGoal(g.id).saved, 3000, '存入 500 后为 3000');
+    Store.updateGoal(g.id, { text: '改了说明', imageId: 'goal_x.jpg' });
+    eq(Store.getGoal(g.id).text, '改了说明', '文本可自由修改');
+    ok(Store.images.save('t1.jpg', 'data:image/jpeg;base64,AAAA') !== undefined, '图片存储接口可用');
+
+    // ---------------- 界面渲染 ----------------
+    sec('界面渲染（DOM 冒烟测试）');
+    var view = document.getElementById('view');
+    ok(view && view.innerHTML.length > 100, '首页渲染出内容');
+
+    var tabs = ['list', 'stats', 'goals', 'ai', 'add'];
+    tabs.forEach(function (t) {
+      var btn = document.querySelector('[data-act="tab"][data-tab="' + t + '"]');
+      if (!btn) { ok(false, '切换标签 ' + t, '找不到按钮'); return; }
+      var errBefore = window.__errors.length;
+      btn.click();
+      var html = document.getElementById('view').innerHTML;
+      ok(html.length > 50 && window.__errors.length === errBefore,
+         '标签「' + t + '」渲染正常', 'HTML ' + html.length + ' 字节');
+    });
+
+    // 设置面板
+    var errB = window.__errors.length;
+    document.querySelector('[data-act="openSettings"]').click();
+    ok(document.getElementById('sheet').innerHTML.length > 500 &&
+       window.__errors.length === errB, '设置面板可打开');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    // 统计页图表
+    document.querySelector('[data-act="tab"][data-tab="stats"]').click();
+    ok(document.getElementById('mainChart') !== null, '统计页生成了图表 canvas');
+
+    // AI 页在未配置时给出提示
+    document.querySelector('[data-act="tab"][data-tab="ai"]').click();
+    ok(document.getElementById('view').innerHTML.indexOf('未配置') > 0, 'AI 页未配置时提示正确');
+
+    // ---------------- 接口地址解析 ----------------
+    sec('大模型接口地址解析');
+    eq(AI.resolveEndpoint('https://api.deepseek.com'), 'https://api.deepseek.com/v1/chat/completions', '根地址补全');
+    eq(AI.resolveEndpoint('https://api.deepseek.com/v1'), 'https://api.deepseek.com/v1/chat/completions', '带 /v1 补全');
+    eq(AI.resolveEndpoint('https://open.bigmodel.cn/api/paas/v4'), 'https://open.bigmodel.cn/api/paas/v4/chat/completions', '智谱 v4 路径');
+    eq(AI.resolveEndpoint('https://x.com/v1/chat/completions'), 'https://x.com/v1/chat/completions', '完整地址不重复拼接');
+    eq(AI.resolveEndpoint('https://dashscope.aliyuncs.com/compatible-mode'), 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', '通义 compatible-mode');
+    eq(AI.resolveEndpoint('http://192.168.1.9:11434'), 'http://192.168.1.9:11434/v1/chat/completions', '本地 Ollama');
+
+    // 提示词构建
+    Store.clearAll(false);
+    Store.addRecord({ date: '2025-03-05', time: '12:30', amount: 25, content: '快餐', category: 'food', note: '' });
+    var msgs = AI.buildMessages(Store.query({}), '找出不必要的花费');
+    ok(msgs.length === 2 && msgs[0].role === 'system' && msgs[1].role === 'user', '提示词结构正确');
+    ok(msgs[1].content.indexOf('餐饮食物') > 0, '提示词包含分类汇总');
+    ok(msgs[1].content.indexOf('2025-03-05 12:30 | 餐饮食物 | 快餐 | -25.00') > 0, '提示词包含标准格式记录');
+    ok(msgs[1].content.indexOf('找出不必要的花费') > 0, '提示词包含用户问题');
+
+    // ---------------- 备份 ----------------
+    sec('数据备份与恢复');
+    var json = Store.exportJSON();
+    ok(json.indexOf('"records"') > 0, '导出 JSON 正常');
+    Store.clearAll(false);
+    eq(Store.query({}).length, 0, '清空后无记录');
+    Store.importJSON(json);
+    eq(Store.query({}).length, 1, '恢复后记录回来');
+
+    // ---------------- 端到端 UI 流程 ----------------
+    sec('记录详情弹层（编辑流程）');
+    Store.clearAll(false);
+    var today = Store.util.dateStr(new Date());
+    Store.addRecord({ date: today, time: '12:30', amount: 25, content: '快餐', category: 'food', note: '原来备注' });
+    document.querySelector('[data-act="tab"][data-tab="list"]').click();
+    var row = document.querySelector('[data-act="openRecord"]');
+    ok(!!row, '明细页出现记录行');
+    if (row) {
+      row.click();
+      ok(document.getElementById('sheet').classList.contains('on'), '详情弹层已打开');
+      ok(document.getElementById('ed-amount') !== null, '弹层含可编辑金额输入框');
+      document.getElementById('ed-amount').value = '30';
+      document.getElementById('ed-note').value = '修改后的备注';
+      document.getElementById('ed-content').value = '公司楼下快餐';
+      document.querySelector('[data-act="saveRecord"]').click();
+      var edited = Store.query({})[0];
+      ok(edited && edited.amount === 30, '编辑后的金额已保存', edited ? edited.amount : 'null');
+      ok(edited && edited.note === '修改后的备注', '编辑后的备注已保存');
+      ok(!document.getElementById('sheet').classList.contains('on'), '保存后弹层已关闭');
+    }
+
+    sec('目标存入 / 取出（界面流程）');
+    Store.clearAll(false);
+    var g2 = Store.addGoal({ title: '测试目标', target: 1000, saved: 500 });
+    document.querySelector('[data-act="tab"][data-tab="goals"]').click();
+    var depBtn = document.querySelector('[data-act="deposit"]');
+    ok(!!depBtn, '目标卡片上有「存入」按钮');
+    depBtn.click();
+    ok(document.getElementById('sheet').classList.contains('on'), '存入弹层已打开');
+    document.getElementById('dep-amount').value = '100';
+    document.querySelector('[data-act="doDeposit"]:not([data-sign])').click();
+    ok(Store.getGoal(g2.id).saved === 600, '存入 100 → 600', Store.getGoal(g2.id).saved);
+
+    document.querySelector('[data-act="deposit"]').click();
+    document.getElementById('dep-amount').value = '50';
+    document.querySelector('[data-act="doDeposit"][data-sign="-1"]').click();
+    ok(Store.getGoal(g2.id).saved === 550, '取出 50 → 550', Store.getGoal(g2.id).saved);
+
+    sec('保存一笔新支出（记账表单流程）');
+    Store.clearAll(false);
+    document.querySelector('[data-act="tab"][data-tab="add"]').click();
+    var amtInput = document.querySelector('[data-bind="form.amount"]');
+    var contentInput = document.querySelector('[data-bind="form.content"]');
+    ok(!!amtInput && !!contentInput, '记账表单包含金额与内容输入框');
+    amtInput.value = '88.5';
+    amtInput.dispatchEvent(new window.Event('input', { bubbles: true }));
+    contentInput.value = '和朋友吃火锅';
+    contentInput.dispatchEvent(new window.Event('input', { bubbles: true }));
+    ok(document.getElementById('suggest-expense').textContent.indexOf('餐饮食物') > 0,
+       '输入内容后自动给出分类建议',
+       document.getElementById('suggest-expense').textContent.trim());
+    document.querySelector('[data-act="save"]').click();
+    var savedRec = Store.query({})[0];
+    ok(!!savedRec && savedRec.amount === 88.5, '金额已保存', savedRec ? savedRec.amount : 'null');
+    ok(!!savedRec && savedRec.content === '和朋友吃火锅', '内容已保存');
+    ok(!!savedRec && savedRec.category === 'food', '自动归档为餐饮食物', savedRec ? savedRec.category : 'null');
+    ok(document.querySelector('[data-bind="form.amount"]').value === '', '保存后表单已清空');
+
+    // ---------------- 实际发出的 HTTP 请求 ----------------
+    sec('实际发出的请求内容（拦截验证）');
+    Store.clearAll(false);
+    Store.saveSettings({
+      llm: {
+        preset: 'deepseek', base: 'https://api.deepseek.com',
+        key: 'sk-abcdef1234567890', model: 'deepseek-chat',
+        stream: false, temperature: 0.6, maxTokens: 1600
+      }
+    });
+
+    var origFetch = window.fetch;
+    function stubFetch(status, bodyText) {
+      var cap = { calls: [] };
+      window.fetch = function (url, opts) {
+        cap.calls.push({
+          url: url,
+          headers: (opts && opts.headers) || {},
+          body: (opts && opts.body) || ''
+        });
+        return Promise.resolve({
+          ok: status >= 200 && status < 300,
+          status: status,
+          text: function () { return Promise.resolve(bodyText); }
+        });
+      };
+      return cap;
+    }
+
+    // 1) 测试连接（非流式）—— 真机上走原生桥，这里验证原生分支
+    window.__lastHttp = null;
+    window.__httpReply = '{"status":200,"body":"{\\"choices\\":[{\\"message\\":{\\"content\\":\\"连接成功\\"}}]}"}';
+    AI.testConnection(function () {});
+    ok(!!window.__lastHttp, '测试连接通过原生桥发出了请求');
+    if (window.__lastHttp) {
+      var c1 = window.__lastHttp;
+      eq(c1.url, 'https://api.deepseek.com/v1/chat/completions', '请求地址拼装正确');
+      eq(c1.headers['Authorization'], 'Bearer sk-abcdef1234567890', 'Authorization 请求头正确');
+      eq(c1.headers['Content-Type'], 'application/json', 'Content-Type 正确');
+      var p1 = {};
+      try { p1 = JSON.parse(c1.body); } catch (e) { /* ignore */ }
+      eq(p1.model, 'deepseek-chat', '请求体模型名正确');
+      eq(p1.stream, false, '测试连接使用非流式');
+      ok(p1.messages && p1.messages.length === 2, '请求体含 system + user 两条消息');
+    }
+
+    // 2) 正式分析（流式）—— 没有 streamStart 时退回 fetch
+    Store.saveSettings({ llm: { stream: true } });
+    var cap2 = stubFetch(200, 'data: {"choices":[{"delta":{"content":"好"}}]}\n\ndata: [DONE]\n\n');
+    AI.analyze(Store.query({}), '帮我看看', { onDelta: function () {}, onDone: function () {}, onError: function () {} }, { stream: true });
+    window.fetch = origFetch;
+
+    ok(cap2.calls.length === 1, '流式分析发出了 1 次请求');
+    if (cap2.calls.length) {
+      var c2 = cap2.calls[0];
+      eq(c2.headers['Authorization'], 'Bearer sk-abcdef1234567890', '流式请求同样带 Authorization');
+      var p2 = {};
+      try { p2 = JSON.parse(c2.body); } catch (e) { /* ignore */ }
+      eq(p2.stream, true, '流式请求 stream=true');
+    }
+
+    // 3) Key 前后的空白会被清掉
+    Store.saveSettings({ llm: { key: '  sk-trimme123  ', stream: false } });
+    window.__lastHttp = null;
+    AI.testConnection(function () {});
+    if (window.__lastHttp) {
+      eq(window.__lastHttp.headers['Authorization'], 'Bearer sk-trimme123', 'Key 两端空白被自动清理');
+    }
+
+    // 4) 未填 Key 时不发送 Authorization（此时服务端必然 401）
+    Store.saveSettings({ llm: { key: '' } });
+    window.__lastHttp = null;
+    AI.testConnection(function () {});
+    if (window.__lastHttp) {
+      eq(window.__lastHttp.headers['Authorization'], undefined, '未填写 Key 时不发 Authorization 头');
+    }
+    window.__httpReply = '{"status":200,"body":"{}"}';
+
+    // ---------------- 报错可读化 ----------------
+    sec('接口报错的可读化处理');
+    Store.saveSettings({ llm: { key: 'sk-abcdef1234567890' } });
+    var m401 = AI.friendlyError(401,
+      '{"error":{"message":"Authentication Fails, Your api key: ****7890 is invalid"}}');
+    ok(m401.indexOf('API Key 无效') >= 0, '401 → 中文结论');
+    ok(m401.indexOf('末四位「7890」') >= 0, '401 → 回显本机 Key 末四位');
+    ok(m401.indexOf('****7890') >= 0, '401 → 保留服务端原始提示（含其回显的末四位）');
+    ok(m401.indexOf('长度 19') >= 0, '401 → 同时给出 Key 长度');
+    ok(AI.friendlyError(402, '{}').indexOf('余额不足') >= 0, '402 → 余额不足');
+    ok(AI.friendlyError(403, '{}').indexOf('没有访问权限') >= 0, '403 → 无权限');
+    ok(AI.friendlyError(404, '{}').indexOf('API 地址不存在') >= 0, '404 → 地址错误');
+    ok(AI.friendlyError(429, '{}').indexOf('请求过于频繁') >= 0, '429 → 频率限制');
+    ok(AI.friendlyError(400, '{}').indexOf('请求格式有误') >= 0, '400 → 格式错误');
+    ok(AI.friendlyError(503, '{}').indexOf('服务端错误') >= 0, '5xx → 服务端错误');
+    ok(AI.friendlyTransportError('HTTP 401 {"error":{"message":"bad key"}}').indexOf('API Key 无效') >= 0,
+       'Java 端回传的 "HTTP 401 ..." 也能被翻译');
+    ok(AI.friendlyError(401, 'not json at all').indexOf('not json at all') >= 0,
+       '非 JSON 的报错体也能原样展示');
+
+    // ---------------- 进账 ----------------
+    sec('进账记录');
+    Store.clearAll(false);
+    Store.addRecord({ date: '2025-03-01', time: '09:00', amount: 8000, type: 'income',
+                      content: '公司发工资', category: 'salary' });
+    Store.addRecord({ date: '2025-03-02', time: '12:00', amount: 50, type: 'expense',
+                      content: '午饭', category: 'food' });
+    var allRec = Store.query({});
+    eq(allRec.length, 2, '两条记录');
+    eq(Store.sumExpense(allRec), 50, '支出合计 50');
+    eq(Store.sumIncome(allRec), 8000, '进账合计 8000');
+    eq(Store.netOf(allRec), 7950, '结余 7950');
+    eq(Store.query({ type: 'income' }).length, 1, '可按类型筛选');
+    var mixText = Store.toText(allRec, {});
+    ok(mixText.indexOf('+8000.00') > 0, '文本记录里进账带 + 号');
+    ok(mixText.indexOf('-50.00') > 0, '文本记录里支出带 - 号');
+    ok(mixText.indexOf('【') < 0, '导出的文本里没有【】符号');
+
+    sec('统计可按日 / 周 / 月 / 年翻页');
+    Store.clearAll(false);
+    var dToday2 = Store.util.dateStr(new Date());
+    Store.addRecord({ date: dToday2, time: '10:00', amount: 11, content: '今天', category: 'other' });
+    document.querySelector('[data-act="tab"][data-tab="stats"]').click();
+
+    document.querySelector('[data-act="statRange"][data-range="today"]').click();
+    ok(document.querySelector('[data-act="statPrev"]') !== null, '按日时可以往前翻');
+    ok(document.querySelector('[data-act="statNext"]') !== null, '按日时可以往后翻');
+    ok(document.querySelector('.period-nav .pn-main') !== null, '显示当前周期的名称');
+
+    var beforeLabel = document.querySelector('.period-nav .pn-main').textContent;
+    document.querySelector('[data-act="statPrev"]').click();
+    var afterLabel = document.querySelector('.period-nav .pn-main').textContent;
+    ok(beforeLabel !== afterLabel, '往前翻之后周期变了',
+       beforeLabel + ' → ' + afterLabel);
+    ok(document.querySelector('[data-act="statNow"]') !== null, '翻页后出现「回到当前」');
+
+    document.querySelector('[data-act="statNow"]').click();
+    eq(document.querySelector('.period-nav .pn-main').textContent, beforeLabel,
+       '「回到当前」能回到今天');
+
+    document.querySelector('[data-act="statRange"][data-range="month"]').click();
+    var mBefore = document.querySelector('.period-nav .pn-main').textContent;
+    document.querySelector('[data-act="statPrev"]').click();
+    ok(document.querySelector('.period-nav .pn-main').textContent !== mBefore,
+       '按月也可以翻到上一个月');
+
+    document.querySelector('[data-act="statRange"][data-range="year"]').click();
+    var yBefore = document.querySelector('.period-nav .pn-main').textContent;
+    document.querySelector('[data-act="statPrev"]').click();
+    ok(document.querySelector('.period-nav .pn-main').textContent !== yBefore,
+       '按年也可以翻到上一年');
+
+    document.querySelector('[data-act="statRange"][data-range="all"]').click();
+    ok(document.querySelector('[data-act="statPrev"]') === null, '全部时间不显示翻页');
+
+    sec('主题默认背景的显示参数');
+    var qStyle = Theme.defaultBgStyleOf('whaleQ');
+    ok(!!qStyle, 'Q版主题有背景显示参数');
+    eq(qStyle && qStyle.scale, 1.1, '默认缩放 110%');
+    eq(qStyle && qStyle.opacity, 0.8, '默认透明度 80%');
+    eq(qStyle && qStyle.blur, 5, '默认虚化 5px');
+    var mStyle = Theme.defaultBgStyleOf('whaleM');
+    eq(mStyle && mStyle.scale, 1.1, '成熟版同样是 110%');
+    ok(Theme.defaultBgStyleOf('default') === null, '普通主题没有这组参数');
+    eq(Store.categoryTotals(allRec, 'income')[0].name, '工资', '进账分类汇总');
+    eq(Store.categoryTotals(allRec, 'expense')[0].name, '餐饮食物', '支出分类汇总');
+    ok(Store.toReport(allRec, {}).indexOf('合计收入：8000.00 元') > 0, '报表含收入合计');
+
+    sec('预算只统计支出（进账不冲抵）');
+    Store.clearAll(false);
+    Store.saveSettings({ monthlyBudget: 3000, dailyBudget: 0, monthStartDay: 1 });
+    Store.addRecord({ date: '2025-03-01', time: '09:00', amount: 500, content: 'a', category: 'other' });
+    Store.addRecord({ date: '2025-03-15', time: '12:00', amount: 40, content: 'b', category: 'other' });
+    Store.addRecord({ date: '2025-03-15', time: '09:00', amount: 9000, type: 'income',
+                      content: '工资', category: 'salary' });
+    var bb2 = Store.budget(new Date(2025, 2, 15));
+    eq(bb2.spentPeriod, 540, '已花只算支出 540');
+    eq(bb2.remaining, 2460, '剩余 2460（不被工资冲抵）');
+    eq(bb2.incomePeriod, 9000, '本账期进账 9000');
+    eq(bb2.netPeriod, 8460, '结余 8460');
+    eq(bb2.spentToday, 40, '今日已花仍是 40');
+    eq(bb2.incomeToday, 9000, '今日进账 9000');
+
+    // ---------------- 日历 ----------------
+    sec('日历视图数据');
+    Store.clearAll(false);
+    Store.addRecord({ date: '2025-03-05', time: '12:00', amount: 100, content: 'a', category: 'food' });
+    Store.addRecord({ date: '2025-03-05', time: '18:00', amount: 30, type: 'income',
+                      content: 'b', category: 'redpack' });
+    Store.addRecord({ date: '2025-03-10', time: '12:00', amount: 200, content: 'c', category: 'food' });
+    var grid = Store.monthGrid(2025, 2);
+    eq(grid.days.length, 31, '3 月共 31 天');
+    eq(grid.days[4].expense, 100, '3-05 支出 100');
+    eq(grid.days[4].income, 30, '3-05 进账 30');
+    eq(grid.days[4].net, -70, '3-05 净额 -70');
+    eq(grid.days[4].count, 2, '3-05 两条记录');
+    eq(grid.days[9].expense, 200, '3-10 支出 200');
+    eq(grid.days[0].expense, 0, '3-01 无支出');
+
+    sec('日历配色规则');
+    Store.clearAll(false);
+    Store.saveSettings({ dailyBudget: 100, monthlyBudget: 0 });
+    Store.addRecord({ date: '2025-03-05', time: '12:00', amount: 60, content: 'a', category: 'food' });
+    var g3 = Store.monthGrid(2025, 2);
+    eq(Calendar.dailyAllowance(g3.days.length), 100, '日额度取 dailyBudget');
+    eq(Calendar.short(1234.5), '1.2k', '日历金额压缩显示');
+    eq(Calendar.short(12345), '1.2万', '万级压缩显示');
+
+    var calBudget = Calendar.render(
+      { year: 2025, month: 2, selected: '2025-03-05', mode: 'budget' }, function () { return ''; });
+    ok(calBudget.indexOf('cal-grid') > 0, '预算模式渲染出网格');
+    ok(calBudget.indexOf('+40') > 0, '没花完显示绿色 +40（100−60）', calBudget.indexOf('+40'));
+    ok(calBudget.indexOf('class="v pos"') > 0, '使用绿色样式');
+
+    var calExpense = Calendar.render(
+      { year: 2025, month: 2, selected: '', mode: 'expense' }, function () { return ''; });
+    ok(calExpense.indexOf('−60') > 0, '支出模式显示红色 −60');
+    ok(calExpense.indexOf('class="v neg"') > 0, '使用红色样式');
+
+    // ---------------- 自定义分类与学习 ----------------
+    sec('自定义分类与自动归类学习');
+    Store.clearAll(false);
+    var myCat = Store.addCustomCategory({
+      name: '健身', icon: '🏋️', color: '#F97316',
+      keywords: ['健身房', '私教', '瑜伽'], kind: 'expense'
+    });
+    eq(Store.customCategories().length, 1, '创建自定义分类');
+    eq(Store.customCategories('expense').length, 1, '按类型查询');
+    eq(Store.catMeta(myCat.id).name, '健身', '分类元信息可解析');
+
+    var hit1 = Store.suggestCategory('楼下健身房月卡', '', 'expense');
+    eq(hit1.category.id, myCat.id, '关键词命中自定义分类');
+    eq(hit1.source, 'custom', '来源标记为 custom');
+
+    var before = Store.suggestCategory('小王烧烤摊', '', 'expense');
+    ok(before.category.id !== myCat.id, '学习前不会归到健身');
+
+    Store.learnCategory('小王烧烤摊', myCat.id, 'expense');
+    var after1 = Store.suggestCategory('小王烧烤摊', '', 'expense');
+    eq(after1.category.id, myCat.id, '学习后相同内容自动归类');
+    eq(after1.source, 'learned', '来源标记为 learned');
+
+    var after2 = Store.suggestCategory('小王烧烤摊位', '', 'expense');
+    eq(after2.category.id, myCat.id, '相似内容也能命中');
+
+    ok(Classify.similarity('公司楼下快餐', '公司楼下快餐') === 1, '相似度：完全相同 = 1');
+    ok(Classify.similarity('公司楼下快餐', '公司楼下快餐店') >= 0.9, '相似度：互为子串 ≈ 0.9');
+    ok(Classify.similarity('公司楼下快餐', '完全不相干的东西') < 0.3, '相似度：无关内容 < 0.3');
+
+    eq(Store.categoryRules().length, 1, '规则库记录了 1 条');
+    Store.clearCategoryRules();
+    eq(Store.categoryRules().length, 0, '可清空规则库');
+
+    Store.deleteCustomCategory(myCat.id);
+    eq(Store.customCategories().length, 0, '可删除自定义分类');
+    eq(Store.catMeta(myCat.id).name, '其他', '删除后原分类退回「其他」');
+
+    sec('进账分类识别');
+    eq(Classify.classify('10月工资', '', { kind: 'income' }).category.name, '工资', '工资识别');
+    eq(Classify.classify('报销差旅费', '', { kind: 'income' }).category.name, '报销', '报销识别');
+    eq(Classify.classify('收到红包', '', { kind: 'income' }).category.name, '红包', '红包识别');
+    eq(Classify.classify('基金收益到账', '', { kind: 'income' }).category.id, 'invest', '理财识别');
+    eq(Classify.classify('莫名其妙的进项', '', { kind: 'income' }).category.id,
+       'other_income', '未知归入其他收入');
+    eq(Classify.list('income').length, 9, '进账分类共 9 个');
+
+    // ---------------- 主题系统 ----------------
+    sec('主题系统');
+    ok(Theme.PRESETS.length >= 8, '预设主题数量', Theme.PRESETS.length);
+    eq(Theme.presetOf('deepseek').color, '#4D6BFE', 'DeepSeek 蓝');
+    eq(Theme.presetOf('pink').name, '樱花粉', '粉色主题');
+    eq(Theme.presetOf('whaleQ').mascot, 'img/mascot-q.png', 'Q版主题带吉祥物');
+    eq(Theme.presetOf('whaleM').mascot, 'img/mascot-m-face.png', '成熟版主题带吉祥物');
+    eq(Theme.presetOf('不存在的id').id, 'default', '未知主题回退默认');
+    eq(Theme.shade('#000000', 0.5), '#808080', 'shade 提亮');
+    eq(Theme.shade('#ffffff', -1), '#000000', 'shade 压暗');
+    ok(Theme.rgba('#FF0000', 0.5).indexOf('255,0,0') > 0, 'rgba 生成正确');
+
+    Theme.apply({ themeId: 'pink', theme: 'dark' });
+    eq(document.documentElement.getAttribute('data-theme-id'), 'pink', '主题写入 html 属性');
+    eq(document.documentElement.style.getPropertyValue('--accent').trim(), '#FF6FA5',
+       '强调色变量已写入');
+    Theme.apply({ themeId: 'custom', themeColor: '#123456', theme: 'dark' });
+    eq(document.documentElement.style.getPropertyValue('--accent').trim(), '#123456',
+       '自定义颜色生效');
+    Theme.apply({ themeId: 'whaleQ', theme: 'dark' });
+    eq(document.documentElement.style.getPropertyValue('--accent').trim(), '#2E7BE8',
+       'Q版主题颜色生效');
+
+    // ---------------- 账单文本解析 ----------------
+    sec('账单文本解析（本地解析，无需 API）');
+    var alipayCsv = [
+      '支付宝交易记录明细查询',
+      '账号:[test@example.com]',
+      '交易号,商家订单号,交易创建时间,付款时间,交易来源地,类型,交易对方,商品名称,金额（元）,收/支,交易状态,服务费（元）',
+      '202501011111,ORDER1,2025-01-05 12:30:00,2025-01-05 12:30:05,支付宝,即时到账,某某餐厅,午餐,25.00,支出,交易成功,0.00',
+      '202501012222,ORDER2,2025-01-06 09:00:00,2025-01-06 09:00:03,支付宝,即时到账,某某公司,工资发放,8000.00,收入,交易成功,0.00',
+      '202501013333,ORDER3,2025-01-07 10:00:00,2025-01-07 10:00:01,支付宝,即时到账,某商家,退款,30.00,不计收支,交易成功,0.00'
+    ].join('\n');
+    var pr = BillImport.parseText(alipayCsv);
+    eq(pr.length, 2, '支付宝 CSV 解析出 2 条（跳过「不计收支」）');
+    eq(pr[0].date, '2025-01-05', '日期解析正确');
+    eq(pr[0].time, '12:30', '时间解析正确');
+    eq(pr[0].amount, 25, '金额解析正确');
+    eq(pr[0].type, 'expense', '支出类型正确');
+    ok(pr[0].content.indexOf('午餐') >= 0, '内容含商品名', pr[0].content);
+    eq(pr[1].type, 'income', '收入类型正确');
+    eq(pr[1].amount, 8000, '收入金额正确');
+
+    var wechatCsv = [
+      '微信支付账单明细,,,,,,,,,,',
+      '微信昵称：[测试],,,,,,,,,,',
+      '起始时间：[2025-02-01 00:00:00] 终止时间：[2025-02-28 23:59:59],,,,,,,,,,',
+      '----------------------微信支付账单明细列表--------------------,,,,,,,,,,',
+      '交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号,商户单号,备注',
+      '2025-02-03 19:20:00,商户消费,海底捞,晚餐,支出,¥168.00,零钱,支付成功,10001,20001,',
+      '2025-02-04 10:00:00,转账,张三,还款,收入,¥500.00,零钱,已存入零钱,10002,20002,备注文字',
+      '2025-02-05 11:00:00,商户消费,某店,已退款订单,支出,¥99.00,零钱,已退款,10003,20003,'
+    ].join('\n');
+    var pw = BillImport.parseText(wechatCsv);
+    eq(pw.length, 2, '微信 CSV 解析出 2 条（跳过已退款）');
+    eq(pw[0].amount, 168, '带 ¥ 的金额解析正确');
+    ok(pw[0].content.indexOf('海底捞') >= 0, '内容含商户名', pw[0].content);
+    eq(pw[1].type, 'income', '转账收入识别');
+    eq(pw[1].amount, 500, '收入金额正确');
+
+    var loose = '2025-03-05 12:30 星巴克咖啡 ¥32.00 支出\n2025-03-06 09:00 工资到账 +8000.00';
+    var pl = BillImport.parseText(loose);
+    ok(pl.length >= 1, '宽松文本至少解析出 1 条', pl.length);
+    eq(pl[0].amount, 32, '宽松解析金额');
+    eq(BillImport.parseText('').length, 0, '空文本返回空数组');
+
+    sec('截图识别的 JSON 处理');
+    var rawJson = '```json\n{"records":[' +
+      '{"date":"2025-05-01","time":"8:30","amount":"25.5","type":"expense","content":"快餐","category":"餐饮食物"},' +
+      '{"date":"","time":"","amount":"8000","type":"income","content":"工资","category":"工资"}]}\n```';
+    var parsedJson = BillImport.extractJson(rawJson);
+    eq(parsedJson.records.length, 2, '能抠出被 ``` 包裹的 JSON');
+    var norm = BillImport.normalizeRecords(parsedJson.records);
+    eq(norm.length, 2, '规范化后仍是 2 条');
+    eq(norm[0].amount, 25.5, '字符串金额转成数字');
+    eq(norm[0].category, 'food', '分类名映射为 id');
+    eq(norm[0].time, '08:30', '时间补齐前导零');
+    eq(norm[1].category, 'salary', '进账分类映射');
+    eq(norm[1].type, 'income', '类型保留 income');
+    ok(/^\d{4}-\d{2}-\d{2}$/.test(norm[1].date), '缺失日期回退为今天');
+    eq(BillImport.normalizeRecords([{ amount: 0 }]).length, 0, '金额非正数的记录被丢弃');
+    eq(BillImport.normalizeRecords(null).length, 0, '空输入安全');
+
+    // ---------------- 新功能界面 ----------------
+    sec('新功能界面渲染');
+    Store.clearAll(false);
+    document.querySelector('[data-act="tab"][data-tab="add"]').click();
+    var addHtml = document.getElementById('view').innerHTML;
+    ok(addHtml.indexOf('记一笔进账') > 0, '记账首页有进账入口');
+    ok(addHtml.indexOf('从账单截图') > 0, '记账首页有账单导入入口');
+    ok(addHtml.indexOf('data-act="save" data-kind="expense"') > 0, '支出保存按钮带类型');
+    ok(addHtml.indexOf('data-act="save" data-kind="income"') > 0, '进账保存按钮带类型');
+
+    ok(document.getElementById('suggest-income') !== null,
+       '进账表单直接显示，不需要再点开');
+
+    // 从进账表单保存一笔
+    var incAmt = document.querySelector('[data-bind="income.amount"]');
+    var incContent = document.querySelector('[data-bind="income.content"]');
+    incAmt.value = '3000';
+    incAmt.dispatchEvent(new window.Event('input', { bubbles: true }));
+    incContent.value = '10月工资';
+    incContent.dispatchEvent(new window.Event('input', { bubbles: true }));
+    document.querySelector('[data-act="save"][data-kind="income"]').click();
+    var incRec = Store.query({ type: 'income' })[0];
+    ok(!!incRec && incRec.amount === 3000, '进账已保存', incRec ? incRec.amount : 'null');
+    eq(incRec.category, 'salary', '进账自动归类为工资');
+
+    document.querySelector('[data-act="tab"][data-tab="list"]').click();
+    document.querySelector('[data-act="listView"][data-view="calendar"]').click();
+    var calView = document.getElementById('view').innerHTML;
+    ok(calView.indexOf('cal-grid') > 0, '明细页可切到日历视图');
+    ok(calView.indexOf('cal-nav') > 0, '日历有月份切换按钮');
+    ok(calView.indexOf('按预算余额') > 0, '日历有配色规则切换');
+
+    document.querySelector('[data-act="tab"][data-tab="stats"]').click();
+    ok(document.getElementById('view').innerHTML.indexOf('进账分析') > 0, '统计页可切到进账分析');
+
+    document.querySelector('[data-act="openSettings"]').click();
+    var setHtml = document.getElementById('sheet').innerHTML;
+    ok(setHtml.indexOf('theme-card') > 0, '设置里有主题选择');
+    ok(setHtml.indexOf('樱花粉') > 0, '包含粉色主题');
+    ok(setHtml.indexOf('鲸鱼娘') > 0, '包含鲸鱼娘主题');
+    ok(setHtml.indexOf('icon-card') > 0, '设置里有图标选择');
+    ok(setHtml.indexOf('分类管理') > 0, '设置里有分类管理');
+    ok(setHtml.indexOf('视觉模型') > 0, '设置里有视觉模型字段');
+    ok(setHtml.indexOf('日历显示规则') > 0, '设置里有日历规则');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    // ---------------- 原生桥与自动记账 ----------------
+    sec('原生桥（HAS_NATIVE 分支）');
+    ok(Store.HAS_NATIVE === true, '检测到原生桥，走原生存储分支');
+    Store.clearAll(false);
+    Store.addRecord({ date: '2025-06-01', time: '10:00', amount: 12, content: '原生存储测试', category: 'other' });
+    eq(Store.query({}).length, 1, '记录写入成功');
+    Store.flush();   // 落盘有 220ms 防抖，断言前先强制写入
+    ok(window.__nativeFiles['db.json'] !== undefined, '确实写到了原生文件存储');
+    ok(String(window.__nativeFiles['db.json']).indexOf('原生存储测试') > 0, '内容进了 db.json');
+
+    sec('自动记账：待确认收付款');
+    Store.clearAll(false);
+    window.__payInbox = [];
+    window.__notifAccess = true;
+
+    window.__payInbox.push({ id: 'a1', ts: Date.now(), source: '微信', type: 'expense',
+      amount: 32, content: '星巴克', raw: '微信支付 向 星巴克 付款 32.00 元' });
+    window.__payInbox.push({ id: 'a2', ts: Date.now(), source: '支付宝', type: 'income',
+      amount: 200, content: '收款到账', raw: '支付宝 收款到账 200.00 元' });
+
+    // 触发一次刷新（init 里挂了 visibilitychange 监听）
+    document.dispatchEvent(new window.Event('visibilitychange'));
+    document.querySelector('[data-act="tab"][data-tab="add"]').click();
+
+    ok(document.getElementById('view').innerHTML.indexOf('pay-banner') > 0,
+       '记账页出现待确认提示条');
+    ok(document.getElementById('view').innerHTML.indexOf('检测到 2 笔收付款') > 0,
+       '提示条显示正确的数量');
+
+    document.querySelector('[data-act="openPayInbox"]').click();
+    ok(document.getElementById('sheet').classList.contains('on'), '待确认面板已打开');
+    ok(document.getElementById('sheet').innerHTML.indexOf('星巴克') > 0, '列出识别到的商户');
+    ok(document.getElementById('sheet').innerHTML.indexOf('src-pill wx') > 0, '标出来自微信');
+    ok(document.getElementById('sheet').innerHTML.indexOf('200.00') > 0 ||
+       document.getElementById('sheet').innerHTML.indexOf('200') > 0, '显示进账金额');
+
+    document.querySelector('[data-act="payConfirm"]').click();
+    var payRecs = Store.query({});
+    eq(payRecs.length, 2, '两条记录已导入账本');
+    eq(Store.sumExpense(payRecs), 32, '支出金额正确');
+    eq(Store.sumIncome(payRecs), 200, '进账金额正确');
+    eq(window.__payInbox.length, 0, '导入后原生收件箱已清空');
+    ok(!document.getElementById('sheet').classList.contains('on'), '导入后面板已关闭');
+
+    sec('自动记账：开启自动入账');
+    Store.clearAll(false);
+    window.__payInbox = [];
+    Store.saveSettings({ payAutoImport: true });
+    window.__payInbox.push({ id: 'b1', ts: Date.now(), source: '微信', type: 'expense',
+      amount: 15, content: '便利店', raw: '微信支付 付款 15.00 元' });
+    document.dispatchEvent(new window.Event('visibilitychange'));
+    eq(Store.query({}).length, 1, '开启后自动写入账本');
+    eq(window.__payInbox.length, 0, '自动处理后收件箱清空');
+    Store.saveSettings({ payAutoImport: false });
+
+    sec('自动记账：权限状态');
+    window.__notifAccess = false;
+    document.dispatchEvent(new window.Event('visibilitychange'));  // 让权限状态刷新
+    document.querySelector('[data-act="openSettings"]').click();
+    ok(document.getElementById('sheet').innerHTML.indexOf('未授权') > 0 ||
+       document.getElementById('sheet').innerHTML.indexOf('未开启') > 0,
+       '未授权时显示提示');
+    ok(document.getElementById('s-payauto') !== null, '设置里有自动入账开关');
+    document.querySelector('[data-act="closeSheet"]').click();
+    window.__notifAccess = true;
+
+    // ---------------- 桌面图标切换 ----------------
+    sec('桌面图标切换');
+    Store.saveSettings({ launcherIcon: 'whale_q_blue' });
+    document.querySelector('[data-act="openSettings"]').click();
+    var iconCard = document.querySelector('[data-act="pickIcon"][data-id="whale_m_blue"]');
+    ok(!!iconCard, '设置里有成熟版图标选项');
+    if (iconCard) {
+      iconCard.click();
+      eq(window.__launcherIcon, 'whale_m_blue', '已调用原生方法切换桌面图标');
+      eq(Store.settings().launcherIcon, 'whale_m_blue', '选择已保存');
+    }
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    // ---------------- 明细批量删除 ----------------
+    sec('明细批量删除');
+    Store.clearAll(false);
+    var dToday = Store.util.dateStr(new Date());
+    for (var bi = 0; bi < 5; bi++) {
+      Store.addRecord({ date: dToday, time: '1' + bi + ':00', amount: 10 + bi,
+                        content: '批量测试' + bi, category: 'other' });
+    }
+    document.querySelector('[data-act="tab"][data-tab="list"]').click();
+    // 前面的日历测试把视图切到了日历，这里要先切回列表
+    var lvList = document.querySelector('[data-act="listView"][data-view="list"]');
+    if (lvList) lvList.click();
+    ok(document.querySelector('[data-act="enterEdit"]') !== null, '列表有「批量删除」按钮');
+
+    document.querySelector('[data-act="enterEdit"]').click();
+    ok(!document.getElementById('bulkbar').hidden, '底部批量操作条已出现');
+    eq(document.querySelectorAll('#view [data-act="pickRecord"]').length, 5,
+       '每条记录前出现勾选框');
+
+    var pickItems = document.querySelectorAll('#view [data-act="pickRecord"]');
+    pickItems[0].click();
+    pickItems[1].click();
+    ok(document.getElementById('bulkbar').innerHTML.indexOf('已选 <b>2</b>') > 0,
+       '计数显示已选 2 笔');
+
+    var origConfirm = window.confirm;
+    window.confirm = function () { return true; };
+    document.querySelector('[data-act="delPicked"]').click();
+    window.confirm = origConfirm;
+    eq(Store.query({}).length, 3, '删除了 2 条，剩 3 条');
+    ok(document.getElementById('bulkbar').hidden, '删除后自动退出多选');
+
+    document.querySelector('[data-act="enterEdit"]').click();
+    document.querySelector('[data-act="pickAll"]').click();
+    ok(document.getElementById('bulkbar').innerHTML.indexOf('已选 <b>3</b>') > 0,
+       '全选选中剩余 3 条');
+    document.querySelector('[data-act="exitEdit"]').click();
+    ok(document.getElementById('bulkbar').hidden, '点「完成」退出多选');
+
+    // ---------------- 浅色背景与护眼 ----------------
+    sec('浅色主题背景与护眼配色');
+    ok(Theme.LIGHT_PRESETS.length >= 6, '浅色背景预设数量', Theme.LIGHT_PRESETS.length);
+    eq(Theme.lightPresetOf('eye').name, '护眼绿', '护眼绿预设存在');
+    eq(Theme.lightPresetOf('sepia').name, '暖黄护眼', '暖黄护眼预设存在');
+    eq(Theme.lightPresetOf('不存在').id, 'white', '未知预设回退纯白');
+
+    var palWhite = Theme.lightPalette('white');
+    eq(palWhite.bg, '#FAFBFC', '纯白背景默认值');
+    var palEye = Theme.lightPalette('eye');
+    eq(palEye.bg, '#C7EDCC', '护眼绿背景');
+    ok(Theme.luminance(palEye.card) > Theme.luminance(palEye.bg), '护眼绿：卡片比背景亮');
+
+    var palCustom = Theme.lightPalette('custom', '#DDEEFF');
+    eq(palCustom.bg, '#DDEEFF', '自定义背景生效');
+    ok(Theme.luminance(palCustom.card) > Theme.luminance(palCustom.bg),
+       '自定义：卡片自动推导得比背景亮');
+    ok(Theme.luminance(palCustom.line) < Theme.luminance(palCustom.card),
+       '自定义：描边比卡片暗');
+
+    Theme.apply({ theme: 'light', themeId: 'default', lightPreset: 'eye' });
+    eq(document.documentElement.style.getPropertyValue('--bg').trim(), '#C7EDCC',
+       '护眼背景写入 CSS 变量');
+    Theme.apply({ theme: 'dark', themeId: 'default' });
+    eq(document.documentElement.style.getPropertyValue('--bg').trim(), '',
+       '切回深色时清掉覆盖值');
+
+    sec('设置面板：底部固定保存按钮');
+    document.querySelector('[data-act="openSettings"]').click();
+    ok(document.querySelector('#sheet .sheet-foot') !== null, '存在固定的底部操作栏');
+    ok(document.querySelector('#sheet .sheet-foot [data-act="saveSettings"]') !== null,
+       '保存按钮在固定栏里');
+    ok(document.querySelector('#sheet .content [data-act="saveSettings"]') === null,
+       '正文里不再有保存按钮（不用滑到底）');
+    ok(document.getElementById('bgGrid') !== null, '有浅色背景选择器');
+
+    document.querySelector('[data-act="pickLightBg"][data-id="eye"]').click();
+    eq(Store.settings().lightPreset, 'eye', '点选护眼绿已保存');
+    eq(document.documentElement.style.getPropertyValue('--bg').trim(), '#C7EDCC',
+       '点选后立即生效');
+    eq(Store.settings().theme, 'light', '自动切到浅色模式');
+
+    // 恢复默认，避免影响后续断言
+    document.querySelector('[data-act="pickLightBg"][data-id="white"]').click();
+    Store.saveSettings({ theme: 'dark', lightPreset: 'white' });
+    Theme.apply(Store.settings());
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    // ---------------- Bug 修复 ----------------
+    sec('Bug 修复：重新识别不再回滚已改内容');
+    Store.clearAll(false);
+    var bugRec = Store.addRecord({ date: dToday, time: '09:00', amount: 25,
+                                   content: '旧内容', category: 'food', note: '旧备注' });
+    document.querySelector('[data-act="tab"][data-tab="list"]').click();
+    document.querySelector('[data-act="openRecord"]').click();
+    document.getElementById('ed-content').value = '改成了健身房年卡';
+    document.getElementById('ed-amount').value = '99';
+    document.getElementById('ed-note').value = '改过的备注';
+    document.querySelector('[data-act="reclassify"]').click();
+
+    var fixed = Store.getRecord(bugRec.id);
+    eq(fixed.content, '改成了健身房年卡', '重新识别后内容保留修改');
+    eq(fixed.amount, 99, '重新识别后金额保留修改');
+    eq(fixed.note, '改过的备注', '重新识别后备注保留修改');
+    ok(document.getElementById('ed-content') !== null, '重新识别后详情面板仍打开');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('Bug 澄清：分类颜色确有作用');
+    Store.clearAll(false);
+    var colorCat = Store.addCustomCategory({ name: '宠物粮', icon: '🐾', color: '#FF00AA',
+                                             keywords: ['猫粮'], kind: 'expense' });
+    eq(Store.catMeta(colorCat.id).color, '#FF00AA', 'catMeta 会返回自定义颜色');
+    Store.addRecord({ date: dToday, time: '10:00', amount: 100, content: '猫粮',
+                      category: colorCat.id });
+
+    var totals2 = Store.categoryTotals(Store.query({}), 'expense');
+    var foundCat = null;
+    totals2.forEach(function (t) { if (t.id === colorCat.id) foundCat = t; });
+    ok(!!foundCat && foundCat.color === '#FF00AA',
+       '统计汇总携带该颜色（环形图/图例/排行条都用它）');
+
+    document.querySelector('[data-act="tab"][data-tab="list"]').click();
+    ok(document.getElementById('view').innerHTML.indexOf('255,0,170') > 0,
+       '明细列表里的图标底色用了这个颜色');
+
+    document.querySelector('[data-act="openSettings"]').click();
+    document.querySelector('[data-act="editCat"]').click();
+    ok(document.getElementById('c-pv-ico') !== null, '分类编辑器里有颜色实时预览');
+    ok(document.getElementById('c-pv-bar1') !== null, '预览里包含统计页用的色条');
+    ok(document.querySelector('#sheet .sheet-foot [data-act="saveCat"]') !== null,
+       '分类保存按钮也在固定底栏');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    // ---------------- 首页欢迎条与自定义图标 ----------------
+    sec('首页欢迎条可编辑');
+    Store.clearAll(false);
+    document.querySelector('[data-act="tab"][data-tab="add"]').click();
+    ok(document.querySelector('[data-act="editHero"]') !== null, '欢迎条上有编辑按钮');
+    ok(document.getElementById('view').innerHTML.indexOf('hero-ico') > 0,
+       '首页顶部有欢迎条与图标位');
+    ok(document.getElementById('suggest-income') !== null,
+       '进账表单与支出一样直接显示');
+
+    document.querySelector('[data-act="editHero"]').click();
+    ok(document.getElementById('h-title') !== null, '编辑器有标题输入框');
+    ok(document.getElementById('h-desc') !== null, '编辑器有介绍文字输入框');
+    ok(document.getElementById('h-bg') !== null, '编辑器有图标背景选项');
+
+    document.getElementById('h-title').value = '我的小账本';
+    document.getElementById('h-desc').value = '每天记一笔，年底不慌张';
+    document.querySelector('[data-act="heroBg"][data-bg="transparent"]').click();
+    ok(document.querySelector('[data-act="heroBg"][data-bg="transparent"]').classList.contains('active'),
+       '透明背景可选中');
+    document.querySelector('[data-act="saveHero"]').click();
+
+    eq(Store.settings().brandTitle, '我的小账本', '标题已保存');
+    eq(Store.settings().brandDesc, '每天记一笔，年底不慌张', '介绍文字已保存');
+    eq(Store.settings().brandIconBg, 'transparent', '背景选择已保存');
+
+    var heroHtml2 = document.getElementById('view').innerHTML;
+    ok(heroHtml2.indexOf('我的小账本') > 0, '首页显示自定义标题');
+    ok(heroHtml2.indexOf('每天记一笔') > 0, '首页显示自定义描述');
+
+    document.querySelector('[data-act="editHero"]').click();
+    document.querySelector('[data-act="heroIconClear"]').click();
+    document.querySelector('[data-act="saveHero"]').click();
+    eq(Store.settings().brandIcon, '', '「用回默认」会清掉自定义图标');
+
+    sec('设置里已移除「自定义桌面图标」');
+    Store.clearAll(false);
+    document.querySelector('[data-act="openSettings"]').click();
+    var setHtml3 = document.getElementById('sheet').innerHTML;
+    ok(setHtml3.indexOf('自定义桌面图标') < 0, '设置里不再有自定义图标区块');
+    ok(document.getElementById('ci-file') === null, '设置里没有选图片入口了');
+    ok(setHtml3.indexOf('分类管理') > 0, '其它设置区块还在');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('图标裁剪器');
+    Store.clearAll(false);
+    document.querySelector('[data-act="tab"][data-tab="add"]').click();
+    document.querySelector('[data-act="editHero"]').click();
+    ok(document.getElementById('crop-box') !== null, '编辑器里有裁剪区');
+    ok(document.getElementById('crop-canvas') !== null, '有裁剪画布');
+    ok(document.getElementById('crop-zoom') !== null, '有缩放滑块');
+    ok(document.getElementById('crop-box').style.display === 'none',
+       '未选图片时裁剪区是隐藏的');
+    ok(document.querySelector('[data-act="cropApply"]') !== null, '有「用这块区域」按钮');
+    ok(document.querySelector('[data-act="cropCancel"]') !== null, '有取消按钮');
+
+    // 拖动 / 缩放接口（jsdom 不解码图片，这里验证状态机与边界钳制）
+    ok(typeof IconKit.loadInto === 'function', 'IconKit 提供载入裁剪的接口');
+    ok(typeof IconKit.panBy === 'function', 'IconKit 提供平移接口');
+    ok(typeof IconKit.zoomTo === 'function', 'IconKit 提供缩放接口');
+    var cs = IconKit.cropState();
+    ok(cs && cs.ready === false, '未载入图片时 ready 为 false');
+
+    // 背景选项在编辑器里同样可用
+    document.querySelector('[data-act="heroBg"][data-bg="transparent"]').click();
+    ok(document.querySelector('[data-act="heroBg"][data-bg="transparent"]').classList.contains('active'),
+       '裁剪编辑器里可切换背景');
+    eq(IconKit.bgValue('transparent'), 'transparent', '透明背景解析正确');
+    eq(IconKit.bgValue('white'), '#FFFFFF', '白色背景解析正确');
+    eq(IconKit.bgValue('dark'), '#1A1F27', '深色背景解析正确');
+    ok(IconKit.bgValue('accent').charAt(0) === '#', '主题色解析为具体色值',
+       IconKit.bgValue('accent'));
+
+    document.querySelector('[data-act="cropCancel"]').click();
+    ok(document.getElementById('crop-box').style.display === 'none', '取消后裁剪区收起');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('存钱目标封面也能裁剪');
+    Store.clearAll(false);
+    document.querySelector('[data-act="tab"][data-tab="goals"]').click();
+    document.querySelector('[data-act="newGoal"]').click();
+    ok(document.getElementById('g-file') !== null, '目标编辑器里有选图片入口');
+    ok(document.getElementById('crop-box') !== null, '目标编辑器里也能裁剪');
+    ok(document.getElementById('g-text') !== null, '目标文字说明还在');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('截图识别的年份修正');
+    var thisYear = new Date().getFullYear();
+
+    // 1) 模型明确说了「账单上没写年份」→ 无论差多少年都拉回最近的一年
+    var fixedRecs = BillImport.normalizeRecords([
+      { date: '2020-10-15', yearKnown: false, time: '08:48', amount: 19.32,
+        type: 'expense', content: '微信支付' }
+    ]);
+    eq(fixedRecs.length, 1, '记录保留');
+    eq(String(fixedRecs[0].date).slice(0, 4), String(thisYear),
+       '明确没写年份 → 拉回今年');
+    eq(String(fixedRecs[0].date).slice(5), '10-15', '月和日保持不变');
+    ok(fixedRecs.fixedYears === 1, '会统计修正了几条', fixedRecs.fixedYears);
+
+    // 2) 模型没说，但年份差得可疑（正好一年）→ 也要拉回
+    var guessRecs = BillImport.normalizeRecords([
+      { date: (thisYear - 1) + '-10-15', time: '08:48', amount: 19.32,
+        type: 'expense', content: '照抄了旧示例年份' }
+    ]);
+    eq(String(guessRecs[0].date).slice(0, 4), String(thisYear),
+       '差一年的可疑年份也会被拉回');
+
+    // 3) 明显是历史账单 → 不动
+    var keptRecs = BillImport.normalizeRecords([
+      { date: '2019-03-02', time: '10:00', amount: 5, type: 'expense', content: '很久以前' }
+    ]);
+    eq(keptRecs[0].date, '2019-03-02', '明显是历史账单的日期不会被乱改');
+
+    // 4) 完全没日期 → 用系统当前日期
+    var emptyDate = BillImport.normalizeRecords([
+      { date: '', time: '', amount: 9.9, type: 'expense', content: '没日期' }
+    ]);
+    eq(emptyDate[0].date, Store.util.dateStr(new Date()),
+       '完全没识别到日期时用系统当前日期');
+
+    ok(BillImport.nearestYearDate('2020-10-15', true) !== '2020-10-15',
+       'nearestYearDate 在强制模式下会纠正');
+    eq(BillImport.nearestYearDate('2019-03-02', false), '2019-03-02',
+       '非强制模式下不动历史日期');
+
+    var msgs = BillImport.buildVisionMessages(['data:image/png;base64,AAAA']);
+    var promptText = msgs[1].content[0].text;
+    ok(promptText.indexOf(Store.util.dateStr(new Date())) >= 0,
+       '提示词里写明了今天的日期');
+    ok(promptText.indexOf(String(thisYear)) >= 0, '提示词里写明了今年年份');
+    ok(promptText.indexOf('2025-01-01') < 0, '提示词里不再有会误导的旧年份示例');
+    ok(promptText.indexOf('yearKnown') >= 0, '提示词要求模型报告年份是否明确');
+
+    sec('免费视觉模型预设');
+    var presetIds = AI.PRESETS.map(function (p) { return p.id; });
+    ok(presetIds.indexOf('doubao') >= 0, '加入了豆包（火山方舟）预设');
+    var dbPreset = AI.PRESETS.filter(function (p) { return p.id === 'doubao'; })[0];
+    ok(!!dbPreset.vision, '豆包预设带视觉模型', dbPreset.vision);
+    ok(String(dbPreset.base).indexOf('volces.com') > 0, '豆包地址指向火山方舟', dbPreset.base);
+
+    var zpPreset = AI.PRESETS.filter(function (p) { return p.id === 'zhipu'; })[0];
+    eq(zpPreset.vision, 'glm-4v-flash', '智谱预设指向免费的 glm-4v-flash');
+    ok(zpPreset.free === true, '智谱被标记为有免费额度');
+
+    var freeCount = AI.PRESETS.filter(function (p) { return p.free; }).length;
+    ok(freeCount >= 5, '至少标出了 5 家免费/有额度的服务商', freeCount + ' 家');
+
+    var ollPreset = AI.PRESETS.filter(function (p) { return p.id === 'ollama'; })[0];
+    ok(!!ollPreset.vision, 'Ollama 本地也给了视觉模型（完全不要 key）', ollPreset.vision);
+
+    sec('自动记账自检');
+    Store.clearAll(false);
+    window.__notifAccess = true;
+    document.dispatchEvent(new window.Event('visibilitychange'));
+    document.querySelector('[data-act="openSettings"]').click();
+    ok(document.querySelector('[data-act="payDiag"]') !== null, '设置里有「自动记账自检」入口');
+    document.querySelector('[data-act="payDiag"]').click();
+    ok(document.getElementById('sheet').classList.contains('on'), '自检面板已打开');
+    var diagHtml = document.getElementById('sheet').innerHTML;
+    ok(diagHtml.indexOf('通知使用权') > 0, '显示权限状态');
+    ok(diagHtml.indexOf('监听服务连接') > 0, '显示服务连接状态');
+    ok(diagHtml.indexOf('最近收到通知') > 0, '显示最近收到通知的时间');
+    ok(diagHtml.indexOf('手动测一遍解析') > 0, '有手动测试解析的入口');
+    ok(document.getElementById('diag-text') !== null, '有粘贴通知原文的输入框');
+    ok(document.querySelector('[data-act="reconnectPay"]') !== null, '有「重新连接服务」按钮');
+
+    document.querySelector('[data-act="diagSample"]').click();
+    ok(document.getElementById('diag-text').value.indexOf('已支付') > 0, '示例已填入');
+    document.querySelector('[data-act="diagRun"]').click();
+    ok(document.getElementById('diag-out').innerHTML.indexOf('识别成功') > 0,
+       '用截图里那条真实通知跑，解析成功');
+    ok(document.getElementById('diag-out').innerHTML.indexOf('支出') > 0, '判定为支出');
+    ok(document.getElementById('diag-out').innerHTML.indexOf('19.32') > 0, '金额识别为 19.32');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('统计：分类明细下钻');
+    Store.clearAll(false);
+    Store.addRecord({ date: '2025-07-01', time: '12:00', amount: 30, content: '快餐A', category: 'food' });
+    Store.addRecord({ date: '2025-07-05', time: '19:00', amount: 300, content: '火锅B', category: 'food' });
+    Store.addRecord({ date: '2025-07-09', time: '09:00', amount: 120, content: '咖啡C', category: 'food' });
+    Store.addRecord({ date: '2025-07-03', time: '10:00', amount: 50, content: '地铁', category: 'transport' });
+    Store.saveSettings({ monthStartDay: 1 });
+
+    document.querySelector('[data-act="tab"][data-tab="stats"]').click();
+    document.querySelector('[data-act="statRange"][data-range="all"]').click();
+    ok(document.querySelector('[data-act="catDetail"]') !== null,
+       '统计页的分类条目可点击下钻');
+    ok(document.querySelector('.legend .row.tap') !== null, '图例行可点击');
+
+    document.querySelector('[data-act="catDetail"][data-id="food"]').click();
+    ok(document.getElementById('sheet').classList.contains('on'), '分类明细面板已打开');
+    var cdHtml = document.getElementById('sheet').innerHTML;
+    ok(cdHtml.indexOf('餐饮食物') > 0, '面板标题是分类名');
+    ok(cdHtml.indexOf('快餐A') > 0 && cdHtml.indexOf('火锅B') > 0, '列出该分类的账单');
+    ok(cdHtml.indexOf('地铁') < 0, '不含其它分类的记录');
+    ok(cdHtml.indexOf('共 3 笔') > 0, '显示笔数');
+    ok(document.querySelector('[data-act="cdSort"][data-sort="time"]') !== null, '有按时间排序');
+    ok(document.querySelector('[data-act="cdSort"][data-sort="amount"]') !== null, '有按金额排序');
+    ok(document.querySelector('[data-act="cdRange"][data-range="day"]') !== null, '有单日筛选');
+    ok(document.querySelector('[data-act="cdRange"][data-range="custom"]') !== null, '有时间段筛选');
+
+    // 默认按时间倒序 → 最晚的「咖啡C」应排第一
+    var firstT1 = document.querySelector('#sheet .items .t1');
+    eq(firstT1 && firstT1.textContent, '咖啡C', '默认按时间倒序');
+
+    // 切到按金额 → 最大的「火锅B」排第一，且带序号
+    document.querySelector('[data-act="cdSort"][data-sort="amount"]').click();
+    var firstT2 = document.querySelector('#sheet .items .t1');
+    eq(firstT2 && firstT2.textContent, '火锅B', '按金额降序');
+    ok(document.querySelector('#sheet .rank-no') !== null, '金额排名显示序号');
+
+    // 再点一次切换升降序
+    document.querySelector('[data-act="cdSort"][data-sort="amount"]').click();
+    var firstT3 = document.querySelector('#sheet .items .t1');
+    eq(firstT3 && firstT3.textContent, '快餐A', '再点一次切换为升序');
+
+    // 单日筛选
+    document.querySelector('[data-act="cdRange"][data-range="day"]').click();
+    ok(document.getElementById('cd-day') !== null, '出现单日选择器');
+    document.getElementById('cd-day').value = '2025-07-05';
+    document.getElementById('cd-day').dispatchEvent(new window.Event('change', { bubbles: true }));
+    var dayItems = document.querySelectorAll('#sheet .items .item');
+    eq(dayItems.length, 1, '单日筛选只剩 1 条');
+    ok(document.getElementById('sheet').innerHTML.indexOf('火锅B') > 0, '剩下的是当天那条');
+
+    // 时间段筛选
+    document.querySelector('[data-act="cdRange"][data-range="custom"]').click();
+    ok(document.getElementById('cd-from') !== null, '出现时间段选择器');
+    document.getElementById('cd-from').value = '2025-07-01';
+    document.getElementById('cd-from').dispatchEvent(new window.Event('change', { bubbles: true }));
+    document.getElementById('cd-to').value = '2025-07-05';
+    document.getElementById('cd-to').dispatchEvent(new window.Event('change', { bubbles: true }));
+    eq(document.querySelectorAll('#sheet .items .item').length, 2, '时间段筛选出 2 条');
+
+    // 全部时间
+    document.querySelector('[data-act="cdRange"][data-range="all"]').click();
+    eq(document.querySelectorAll('#sheet .items .item').length, 3, '全部时间回到 3 条');
+
+    // 点条目能打开记录详情
+    document.querySelector('#sheet .items .item').click();
+    ok(document.getElementById('ed-content') !== null, '从分类明细能点进单条记录');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('应用背景图片');
+    Store.clearAll(false);
+    document.querySelector('[data-act="openSettings"]').click();
+    var bgHtml = document.getElementById('sheet').innerHTML;
+    ok(bgHtml.indexOf('背景图片') > 0, '设置里有「背景图片」区块');
+    ok(document.getElementById('bg-file') !== null, '有选择图片入口');
+    ok(document.getElementById('bg-scale') !== null, '有缩放滑块');
+    ok(document.getElementById('bg-opacity') !== null, '有透明度滑块');
+    ok(document.getElementById('bg-blur') !== null, '有虚化滑块');
+    ok(document.getElementById('appbg') !== null, '页面里有背景图层');
+
+    ok(document.getElementById('appbg').style.display === 'none', '未设置时背景图层隐藏');
+    ok(!document.documentElement.hasAttribute('data-appbg'), '未设置时没有 data-appbg 标记');
+
+    var opEl = document.getElementById('bg-opacity');
+    opEl.value = '70';
+    opEl.dispatchEvent(new window.Event('input', { bubbles: true }));
+    eq(Store.settings().bgOpacity, 0.7, '透明度即时写入设置');
+    eq(document.getElementById('bg-opacity-v').textContent, '70%', '透明度数值同步显示');
+
+    var scEl = document.getElementById('bg-scale');
+    scEl.value = '180';
+    scEl.dispatchEvent(new window.Event('input', { bubbles: true }));
+    eq(Store.settings().bgScale, 1.8, '缩放即时写入设置');
+
+    var blEl = document.getElementById('bg-blur');
+    blEl.value = '8';
+    blEl.dispatchEvent(new window.Event('input', { bubbles: true }));
+    eq(Store.settings().bgBlur, 8, '虚化即时写入设置');
+    eq(document.getElementById('bg-blur-v').textContent, '8px', '虚化数值同步显示');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('背景图回显与移除');
+    var bgName = Store.images.save('bg_test.jpg', 'data:image/jpeg;base64,AAAA');
+    Store.saveSettings({ bgImage: bgName, bgScale: 1.6, bgOpacity: 0.6, bgBlur: 4 });
+    document.querySelector('[data-act="openSettings"]').click();
+    ok(document.getElementById('bg-preview').querySelector('img') !== null,
+       '设置里显示当前背景预览');
+    eq(document.getElementById('bg-scale').value, '160', '缩放滑块回显已保存的值');
+    eq(document.getElementById('bg-opacity').value, '60', '透明度滑块回显已保存的值');
+    eq(document.getElementById('bg-blur').value, '4', '虚化滑块回显已保存的值');
+    document.querySelector('[data-act="clearBgImage"]').click();
+    eq(Store.settings().bgImage, '', '「移除背景」会清空设置');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    sec('应用更名与文案');
+    ok(document.querySelector('.brand').textContent.indexOf('大肥鱼记账本') > 0,
+       '顶栏显示新名称「大肥鱼记账本」');
+
+    sec('AI：回答格式与输入框');
+    Store.clearAll(false);
+    // renderAI 在未配置大模型时只显示配置引导，所以这里先配上
+    Store.saveSettings({ llm: { preset: 'deepseek', base: 'https://api.deepseek.com',
+      model: 'deepseek-chat', key: 'sk-harness-test', stream: false } });
+    Store.addRecord({ date: Store.util.dateStr(new Date()), time: '12:00',
+                      amount: 30, content: '测试餐', category: 'food' });
+    Store.pushChat('user', '你好');
+    Store.pushChat('assistant', '**加粗**的建议 ### 小标题 `代码`');
+
+    document.querySelector('[data-act="tab"][data-tab="ai"]').click();
+    ok(document.getElementById('chat').innerHTML.indexOf('加粗的建议') > 0,
+       '历史消息里的 ** 渲染时被剥掉');
+    ok(document.getElementById('chat').innerHTML.indexOf('小标题') > 0,
+       '### 标题记号被剥掉，文字保留');
+    ok(document.getElementById('chat').innerHTML.indexOf('**') < 0,
+       '界面上不出现 Markdown 星号');
+    ok(document.getElementById('chat').innerHTML.indexOf('###') < 0,
+       '界面上不出现 Markdown 标题记号');
+    ok(document.querySelector('[data-act="clearChat"]') !== null, '有清空对话记忆按钮');
+
+    var aiQ = document.getElementById('aiQ');
+    aiQ.value = '帮我看看这个月';
+    document.querySelector('[data-act="ask"]').click();
+    eq(document.getElementById('aiQ').value, '', '点开始分析后输入框被清空');
+
+    document.querySelector('[data-act="clearChat"]').click();
+    eq(Store.chats().length, 0, '清空后历史记录为空');
+    ok(document.getElementById('chat').innerHTML.indexOf('对话记忆已清空') > 0,
+       '给出「已清空」的提示');
+
+    sec('自动记账：待确认记录可编辑');
+    Store.clearAll(false);
+    window.__payInbox = [{ id: 'e1', ts: Date.now(), source: '微信', type: 'expense',
+                           amount: 32, content: '星巴克', raw: '微信支付 付款 32.00 元' }];
+    document.dispatchEvent(new window.Event('visibilitychange'));
+    // 待确认入口在记账页的提示条上
+    document.querySelector('[data-act="tab"][data-tab="add"]').click();
+    document.querySelector('[data-act="openPayInbox"]').click();
+    ok(document.querySelector('[data-act="payEdit"][data-id="e1"]') !== null,
+       '待确认记录可以点开修改');
+    document.querySelector('[data-act="payEdit"][data-id="e1"]').click();
+    ok(document.getElementById('pe-content') !== null, '可以改内容');
+    ok(document.getElementById('pe-amount') !== null, '可以改金额');
+    ok(document.getElementById('pe-cat') !== null, '可以指定分类');
+    ok(document.getElementById('pe-date') !== null, '可以改日期');
+    ok(document.getElementById('pe-note') !== null, '可以加备注');
+
+    document.getElementById('pe-content').value = '改了名字的店';
+    document.getElementById('pe-amount').value = '19';
+    document.querySelector('[data-act="peType"][data-type="income"]').click();
+    document.querySelector('[data-act="payEditSave"]').click();
+    ok(document.getElementById('sheet').innerHTML.indexOf('改了名字的店') > 0,
+       '保存后列表显示新内容');
+    ok(document.getElementById('sheet').innerHTML.indexOf('已改') > 0, '标出这条被改过');
+
+    document.querySelector('[data-act="payConfirm"]').click();
+    var peRecs = Store.query({});
+    eq(peRecs.length, 1, '导入了一条');
+    eq(peRecs[0].content, '改了名字的店', '导入的是改过的内容');
+    eq(peRecs[0].amount, 19, '导入的是改过的金额');
+    eq(peRecs[0].type, 'income', '导入的是改过的类型');
+
+    sec('主题默认背景与表情包主题');
+    eq(Theme.defaultBgOf('whaleQ'), 'img/bg-q.jpg', 'Q版主题有默认背景');
+    eq(Theme.defaultBgOf('whaleM'), 'img/bg-m.jpg', '成熟版主题有默认背景');
+    eq(Theme.defaultBgOf('default'), '', '普通主题没有默认背景');
+
+    var fishPreset = Theme.presetOf('fish');
+    eq(fishPreset.name, '大肥鱼表情包', '新增表情包主题');
+    eq(fishPreset.color, '#4D6BFE', '表情包主题用 DeepSeek 蓝');
+    eq(fishPreset.mascot, 'img/mascot-fish.png', '表情包主题用表情图当头像');
+
+    sec('桌面图标新增透明表情包');
+    document.querySelector('[data-act="openSettings"]').click();
+    var fishCard = document.querySelector('[data-act="pickIcon"][data-id="fish_meme"]');
+    ok(fishCard !== null, '桌面图标里多了一个表情包选项');
+    ok(document.querySelector('#iconGrid img[src*="icon-fish_meme"]') !== null,
+       '预览用的是生成好的真实图标');
+    ok(document.getElementById('sheet').innerHTML.indexOf('大肥鱼') > 0, '名称为「大肥鱼」');
+
+    sec('背景图裁剪');
+    var cs2 = IconKit.cropState();
+    ok(cs2.presets.indexOf('bg') >= 0, '裁剪器支持背景图预设（竖版 9:16）');
+    ok(document.getElementById('crop-box') !== null, '背景图设置里有裁剪区');
+    document.querySelector('[data-act="closeSheet"]').click();
+
+    // ---------------- 运行期错误 ----------------
+    sec('运行期错误监控');
+    ok(window.__errors.length === 0, '无未捕获的 JS 错误',
+       window.__errors.length ? window.__errors.join(' ; ') : '');
+
+    // ---------------- 输出 ----------------
+    log('<div class="sec" style="margin-top:16px;font-size:14px">'
+      + (fail === 0 ? '<span class="pass">全部 ' + pass + ' 项测试通过</span>'
+                    : '<span class="fail">' + fail + ' 项失败</span>，' + pass + ' 项通过')
+      + '</div>');
+    log('<div id="summary" data-pass="' + pass + '" data-fail="' + fail + '" style="display:none"></div>');
+
+    var rep = document.createElement('div');
+    rep.id = 'report';
+    rep.innerHTML = out.join('\n');
+    document.body.appendChild(rep);
+    document.title = 'RESULT pass=' + pass + ' fail=' + fail;
+  }
+
+  // 等 app.js 初始化完成
+  setTimeout(function () {
+    try { run(); }
+    catch (e) {
+      var rep = document.createElement('div');
+      rep.id = 'report';
+      rep.innerHTML = '<div class="fail">测试框架异常：' + e.message +
+        '<br>发生在章节：「' + currentSection + '」' +
+        '<br>已经跑了 ' + pass + ' 项通过 / ' + fail + ' 项失败</div>' +
+        '<pre>' + (e.stack || '') + '</pre>' +
+        '<div class="sec" style="margin-top:12px">──── 异常前已执行的断言 ────</div>' +
+        out.join('\n');
+      document.body.appendChild(rep);
+      document.title = 'RESULT pass=0 fail=99';
+    }
+  }, 400);
+})();
+</script>
+</body>
+</html>

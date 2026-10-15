@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<!-- 让所有相对资源（css/ js/ img/）都按真实 App 里的路径解析 -->
+<base href="../android/assets/www/" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>记账本</title>
+<link rel="stylesheet" href="css/app.css" />
+<style>
+  /* 截图专用：关闭过渡与动画，保证抓到的是稳定终态而非动画中间帧 */
+  *, *::before, *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+</style>
+<script>
+  /* 让 Canvas 图表直接绘制终态 */
+  window.__NO_ANIM = true;
+</script>
+</head>
+<body>
+
+<div id="appbg" aria-hidden="true"></div>
+
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><span class="logo">💰</span><span>大肥鱼记账本</span></div>
+    <div class="spacer"></div>
+    <button class="icon-btn" data-act="openSettings">⚙️</button>
+  </header>
+  <main id="view"></main>
+  <div class="bulk-bar" id="bulkbar" hidden></div>
+  <nav class="tabbar" id="tabbar"></nav>
+</div>
+<div class="sheet-mask" id="sheet-mask" data-act="closeSheet"></div>
+<div class="sheet" id="sheet"></div>
+<div id="toast"></div>
+
+<script>
+  /* 截图页也需要原生桥，否则自动记账区块和待确认提示条不会出现 */
+  window.__nativeFiles = {};
+  window.__payInbox = [];
+  window.__launcherIcon = 'whale_q_blue';
+  window.__notifAccess = true;
+  window.Android = {
+    fsReady: function () { return true; },
+    fsRead: function (f) {
+      return Object.prototype.hasOwnProperty.call(window.__nativeFiles, f) ? window.__nativeFiles[f] : null;
+    },
+    fsWrite: function (f, c) { window.__nativeFiles[f] = c; return true; },
+    fsExists: function (f) { return Object.prototype.hasOwnProperty.call(window.__nativeFiles, f); },
+    fsDelete: function (f) { delete window.__nativeFiles[f]; return true; },
+    fsList: function () { return '[]'; },
+    saveImage: function () { return true; },
+    loadImage: function () { return null; },
+    deleteImage: function () { return true; },
+    httpRequest: function () { return '{"status":200,"body":"{}"}'; },
+    copy: function () { return true; },
+    share: function () { return true; },
+    toast: function () {},
+    dataDir: function () { return '/data/demo'; },
+    setLauncherIcon: function (k) { window.__launcherIcon = k; return true; },
+    getLauncherIcon: function () { return window.__launcherIcon; },
+    hasPayAccess: function () { return window.__notifAccess; },
+    openPayAccessSettings: function () { return true; },
+    listPayInbox: function () { return JSON.stringify(window.__payInbox); },
+    removePayInbox: function () { return true; },
+    clearPayInbox: function () { window.__payInbox = []; return true; },
+    injectTestPay: function () { return true; },
+    testPayParse: function () { return '{"ok":true}'; }
+  };
+</script>
+
+<script src="js/theme.js"></script>
+<script src="js/classify.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/store.js"></script>
+<script src="js/calendar.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/import.js"></script>
+<script src="js/app.js"></script>
+
+<script>
+/* 截图专用：播种一份有代表性的演示数据，然后切到指定标签页 */
+(function () {
+  // 注意：file:// URL 的 ?query 会被 Chromium 当成文件名的一部分，
+  // 所以这里用 #片段 传参。
+  var src = (location.hash || '').replace(/^#/, '') ||
+            (location.search || '').replace(/^\?/, '');
+  var q = /tab=(\w+)/.exec(src);
+  var tab = q ? q[1] : 'add';
+  var s = /sheet=(\w+)/.exec(src);
+  var wantSheet = s ? s[1] : '';
+  var m = /mode=(\w+)/.exec(src);
+  var wantMode = m ? m[1] : '';
+  var wantIncome = /income=1/.test(src);
+  var wantCal = /view=calendar/.test(src);
+  var wantTheme = /theme=(\w+)/.exec(src);
+  var wantCalMode = /calmode=(\w+)/.exec(src);
+  var wantScroll = /scroll=(\d+)/.exec(src);
+  var wantEdit = /edit=1/.test(src);
+  var wantLight = /light=(\w+)/.exec(src);
+  var wantPay = /pay=1/.test(src);
+  var wantCi = /ci=1/.test(src);
+  var wantHero = /hero=1/.test(src);
+  var wantCatDetail = /catdetail=1/.test(src);
+  var wantCatSort = (/catsort=(\w+)/.exec(src) || [])[1] || 'time';
+  var wantBg = /bg=1/.test(src);
+  var wantBgView = /bgview=1/.test(src);
+  var wantDiag = /diag=1/.test(src);
+  var wantGoalCrop = /goalcrop=1/.test(src);
+
+  function seed() {
+    Store.clearAll(false);
+    Store.saveSettings({
+      monthlyBudget: 6000,
+      dailyBudget: 200,
+      monthStartDay: 1,
+      theme: wantLight ? 'light' : 'dark',
+      lightPreset: wantLight ? wantLight[1] : 'white',
+      themeId: wantTheme ? wantTheme[1] : 'default',
+      launcherIcon: 'whale_q_blue',
+      calendarMode: wantCalMode ? wantCalMode[1] : 'budget',
+      llm: {
+        preset: 'deepseek',
+        base: 'https://api.deepseek.com',
+        model: 'deepseek-chat',
+        visionModel: 'qwen-vl-max',
+        key: 'sk-demo-1234567890abcd',
+        stream: true,
+        temperature: 0.6,
+        maxTokens: 1600
+      }
+    });
+    Theme.apply(Store.settings());
+
+    // 自定义分类示例
+    Store.addCustomCategory({
+      name: '健身', icon: '🏋️', color: '#F97316',
+      keywords: ['健身房', '私教', '瑜伽'], kind: 'expense'
+    });
+
+    var today = new Date();
+    function d(off) {
+      return Store.util.dateStr(new Date(today.getFullYear(), today.getMonth(), today.getDate() - off));
+    }
+
+    var rows = [
+      [0, '12:20', 32,    '公司楼下快餐',      'food',          '加了鸡腿，比平时贵'],
+      [0, '08:10', 6.5,   '地铁通勤',          'transport',     ''],
+      [0, '20:40', 89,    '京东买纸巾和洗衣液', 'daily',         '家里囤货'],
+      [1, '12:05', 28,    '外卖麻辣烫',        'food',          ''],
+      [1, '19:20', 45,    '和朋友吃火锅',      'food',          'AA 制，人均这个价'],
+      [1, '09:00', 3,     '共享单车',          'transport',     ''],
+      [2, '13:15', 158,   '淘宝买衣服',        'shopping',      '换季添两件'],
+      [2, '16:00', 22,    '星巴克拿铁',        'food',          '下午提神'],
+      [3, '10:30', 220,   '猫粮和猫砂',        'pet',           '主子一个月口粮'],
+      [3, '12:45', 26,    '食堂午餐',          'food',          ''],
+      [4, '21:00', 120,   '电影票两张',        'entertainment', '周末场'],
+      [5, '11:00', 560,   '房租物业费',        'housing',       ''],
+      [6, '14:20', 78,    '药店买感冒药',      'medical',       '换季着凉了'],
+      [7, '12:00', 35,    '火锅',              'food',          ''],
+      [8, '09:30', 300,   '理发烫发',          'apparel',       '三个月一次'],
+      [9, '18:00', 45,    '买书',              'study',         '专业书'],
+      [10, '10:00', 99,   '充话费',            'telecom',       ''],
+      [11, '15:30', 1280, '京东买显示器',      'digital',       '办公用，旧的坏了'],
+      [12, '12:30', 30,   '午饭',              'food',          ''],
+      [13, '20:00', 200,  '给妈妈的红包',      'social',        ''],
+      [14, '16:40', 66,   '超市买菜',          'food',          ''],
+      [15, '11:20', 45,   '打车',              'transport',     '赶时间'],
+      [16, '19:30', 180,  '酒店住宿',          'travel',        '周末短途'],
+      [17, '12:10', 24,   '快餐',              'food',          ''],
+      [18, '13:00', 58,   '超市日用品',        'daily',         ''],
+      [19, '09:15', 12,   '早餐豆浆油条',      'food',          '']
+    ];
+
+    rows.forEach(function (r) {
+      Store.addRecord({
+        date: d(r[0]), time: r[1], amount: r[2],
+        content: r[3], category: r[4], note: r[5]
+      });
+    });
+
+    // 进账示例
+    [
+      [14, '09:30', 12000, '10 月工资', 'salary', ''],
+      [9, '16:00', 480, '报销差旅费', 'reimburse', '上月出差'],
+      [4, '20:15', 200, '同事还钱', 'other_income', ''],
+      [2, '12:00', 66, '淘宝退款', 'refund', '']
+    ].forEach(function (r) {
+      Store.addRecord({
+        date: d(r[0]), time: r[1], amount: r[2], type: 'income',
+        content: r[3], category: r[4], note: r[5]
+      });
+    });
+
+    var g1 = Store.addGoal({
+      title: '年底存下 2 万块',
+      target: 20000,
+      saved: 8600,
+      deadline: '2025-12-31',
+      text: '每月发薪后先转 2000 到储蓄卡，剩下的才拿去花。\n\n目标用途：换一台相机 + 留一笔应急备用金。\n\n自定规则：一个月点外卖不超过 8 次；做到的月份允许自己安排一次短途旅行作为奖励。'
+    });
+    Store.addGoal({
+      title: '换一台新相机',
+      target: 8999,
+      saved: 3200,
+      deadline: '2026-03-01',
+      text: '看中的是索尼 A7C2，等大促再入手。'
+    });
+
+    // 给第一个目标配一张演示图片
+    if (Store.imageOverride !== false) {
+      Store.db.goals.forEach(function (g) {
+        if (g.id === g1.id) { g.imageId = 'demo.png'; }
+      });
+      var originalLoad = Store.images.load;
+      Store.images.load = function (name) {
+        if (name === 'demo.png') return 'demo.png';
+        return originalLoad.call(Store.images, name);
+      };
+    }
+
+    Store.clearChats();
+    Store.pushChat('user', '帮我找出这个月不必要的花费');
+    Store.pushChat('assistant',
+      '根据你的记账记录，我筛出了几项「可以避免或压缩」的支出：\n\n' +
+      '1. 咖啡奶茶类——星巴克拿铁 22 元、外卖麻辣烫 28 元等共 5 笔，合计约 133 元。频率约每 1.5 天一次，若减半，每月可省约 65 元。\n\n' +
+      '2. 娱乐休闲 120 元（电影票两张）——属于可延后消费，改为每月一次可省约 120 元。\n\n' +
+      '3. 打车 45 元——同日已有地铁出行记录，属于可替代支出。\n\n' +
+      '合计建议削减：约 230 元 / 月，占你本月支出的 7.6%。');
+  }
+
+  function go() {
+    seed();
+    var btn = document.querySelector('[data-act="tab"][data-tab="' + tab + '"]');
+    if (btn) btn.click();
+
+    if (wantMode) {
+      var mb = document.querySelector('[data-act="statMode"][data-mode="' + wantMode + '"]');
+      if (mb) mb.click();
+    }
+
+    if (wantCal) {
+      // 切到明细页并打开日历
+      var lb = document.querySelector('[data-act="tab"][data-tab="list"]');
+      if (lb) lb.click();
+      var vb = document.querySelector('[data-act="listView"][data-view="calendar"]');
+      if (vb) vb.click();
+    }
+
+    if (wantPay) {
+      window.__payInbox = [
+        { id: 'd1', ts: Date.now() - 1800000, source: '微信', type: 'expense', amount: 32,
+          content: '星巴克', raw: '微信支付 向 星巴克 付款 32.00 元' },
+        { id: 'd2', ts: Date.now() - 7200000, source: '支付宝', type: 'expense', amount: 168,
+          content: '海底捞', raw: '支付宝 付款成功 168.00 元 收款方：海底捞' },
+        { id: 'd3', ts: Date.now() - 86400000, source: '微信', type: 'income', amount: 200,
+          content: '同事还钱', raw: '微信支付收款 收款到账 200.00 元' }
+      ];
+      document.dispatchEvent(new window.Event('visibilitychange'));
+    }
+
+    if (wantCi) {
+      // 打开首页图标编辑器，并直接往裁剪器里塞一张图（真实浏览器才会解码图片）
+      document.querySelector('[data-act="editHero"]').click();
+      setTimeout(function () {
+        var srcImg = /bg=(\w+)/.exec(src);
+        var bg = srcImg ? srcImg[1] : 'accent';
+        var chip = document.querySelector('[data-act="heroBg"][data-bg="' + bg + '"]');
+        if (chip) chip.click();
+        IconKit.loadInto('img/mascot-q.png', function () {
+          var sc = document.querySelector('#sheet .content');
+          if (sc) sc.scrollTop = parseInt(wantScroll ? wantScroll[1] : '700', 10);
+        });
+      }, 60);
+    }
+
+    if (wantHero) {
+      document.querySelector('[data-act="editHero"]').click();
+      setTimeout(function () {
+        document.querySelector('[data-act="heroBg"][data-bg="transparent"]').click();
+      }, 60);
+    }
+
+    if (wantCatDetail) {
+      document.querySelector('[data-act="tab"][data-tab="stats"]').click();
+      document.querySelector('[data-act="statRange"][data-range="month"]').click();
+      setTimeout(function () {
+        var catId = (/catid=(\w+)/.exec(src) || [])[1];
+        var cd2 = catId
+          ? document.querySelector('[data-act="catDetail"][data-id="' + catId + '"]')
+          : document.querySelector('[data-act="catDetail"]');
+        if (cd2) cd2.click();
+        if (wantCatSort === 'amount') {
+          setTimeout(function () {
+            var s2 = document.querySelector('[data-act="cdSort"][data-sort="amount"]');
+            if (s2) s2.click();
+          }, 40);
+        }
+      }, 60);
+    }
+
+    if (wantBg) {
+      // 先往图片仓库塞一张（用相对路径当 dataURL，浏览器照样能显示）
+      if (window.Android && Android.saveImage) {
+        Android.saveImage('bgshot.jpg', 'img/mascot-q.png');
+      }
+      document.querySelector('[data-act="openSettings"]').click();
+      setTimeout(function () {
+        Store.saveSettings({ bgImage: 'bgshot.jpg', bgScale: 1.2, bgOpacity: 0.55, bgBlur: 3 });
+        // 拨一下滑块，让它真正应用并刷新外观
+        var sl = document.querySelector('#bg-scale');
+        if (sl) {
+          sl.value = '120';
+          sl.dispatchEvent(new window.Event('input', { bubbles: true }));
+        }
+        if (wantBgView) {
+          setTimeout(function () {
+            var cl = document.querySelector('[data-act="closeSheet"]');
+            if (cl) cl.click();
+          }, 60);
+        } else {
+          var sc2 = document.querySelector('#sheet .content');
+          if (sc2) sc2.scrollTop = parseInt(wantScroll ? wantScroll[1] : '980', 10);
+        }
+      }, 80);
+    }
+
+    if (wantDiag) {
+      document.querySelector('[data-act="openSettings"]').click();
+      setTimeout(function () {
+        document.querySelector('[data-act="payDiag"]').click();
+        setTimeout(function () {
+          var s3 = document.querySelector('[data-act="diagSample"]');
+          if (s3) s3.click();
+          var r3 = document.querySelector('[data-act="diagRun"]');
+          if (r3) r3.click();
+        }, 50);
+      }, 60);
+    }
+
+    if (wantGoalCrop) {
+      document.querySelector('[data-act="tab"][data-tab="goals"]').click();
+      setTimeout(function () {
+        document.querySelector('[data-act="newGoal"]').click();
+        setTimeout(function () {
+          IconKit.loadInto('img/mascot-q.png', 'goal', function () {
+            var sc3 = document.querySelector('#sheet .content');
+            if (sc3) sc3.scrollTop = parseInt(wantScroll ? wantScroll[1] : '420', 10);
+          });
+        }, 60);
+      }, 60);
+    }
+
+    if (wantEdit) {
+      var eb = document.querySelector('[data-act="enterEdit"]');
+      if (eb) {
+        eb.click();
+        var picks = document.querySelectorAll('#view [data-act="pickRecord"]');
+        if (picks[0]) picks[0].click();
+        if (picks[1]) picks[1].click();
+        if (picks[3]) picks[3].click();
+      }
+    }
+
+    if (wantIncome) {
+      // 进账表单现在默认就是展开的，填点内容让它看起来是活的
+      var ci = document.querySelector('[data-bind="income.content"]');
+      if (ci) {
+        ci.value = '10 月工资';
+        ci.dispatchEvent(new window.Event('input', { bubbles: true }));
+      }
+      var ai = document.querySelector('[data-bind="income.amount"]');
+      if (ai) {
+        ai.value = '12000';
+        ai.dispatchEvent(new window.Event('input', { bubbles: true }));
+      }
+    }
+
+    if (wantSheet === 'settings') {
+      document.querySelector('[data-act="openSettings"]').click();
+    } else if (wantSheet === 'settings2') {
+      document.querySelector('[data-act="openSettings"]').click();
+      setTimeout(function () {
+        var sc = document.querySelector('#sheet .content');
+        if (sc) sc.scrollTop = 99999;
+      }, 20);
+    } else if (wantSheet === 'pay') {
+      setTimeout(function () {
+        var pb = document.querySelector('[data-act="openPayInbox"]');
+        if (pb) pb.click();
+      }, 40);
+    } else if (wantSheet === 'cat') {
+      document.querySelector('[data-act="openSettings"]').click();
+      var c2 = document.querySelector('[data-act="editCat"]');
+      if (c2) c2.click();
+    } else if (wantSheet === 'bill') {
+      document.querySelector('[data-act="openBillImport"]').click();
+      var bt = document.querySelector('#bill-text');
+      var demo = [
+        '交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态',
+        '2025-10-08 12:30:00,商户消费,某某餐厅,午餐,支出,¥32.00,零钱,支付成功',
+        '2025-10-09 09:00:00,转账,某某公司,工资发放,收入,¥12000.00,零钱,已存入零钱',
+        '2025-10-10 19:20:00,商户消费,海底捞,晚餐,支出,¥168.00,零钱,支付成功'
+      ].join('\n');
+      if (bt) {
+        bt.value = demo;
+        var rb = document.querySelector('[data-act="billRun"]');
+        if (rb) rb.click();
+      }
+    } else if (wantSheet === 'failtest') {
+      // 演示「连接失败」诊断面板：伪造一次 401 响应
+      document.querySelector('[data-act="openSettings"]').click();
+      var origFetch = window.fetch;
+      window.fetch = function () {
+        return Promise.resolve({
+          ok: false,
+          status: 401,
+          text: function () {
+            return Promise.resolve('{"error":{"message":"Authentication Fails, Your api key: ****7890 is invalid (request_id: e795a93a-e3a4-491b-97d4-68fdbe1080b1)","type":"authentication_error","code":"invalid_request_error"}}');
+          }
+        });
+      };
+      setTimeout(function () {
+        var b = document.querySelector('[data-act="testApi"]');
+        if (b) b.click();
+        window.fetch = origFetch;
+      }, 30);
+    } else if (wantSheet === 'export') {
+      document.querySelector('[data-act="tab"][data-tab="list"]').click();
+      var ex = document.querySelector('[data-act="exportList"]');
+      if (ex) ex.click();
+    }
+
+    if (wantScroll) {
+      setTimeout(function () {
+        var panel = document.querySelector('#sheet.on .content');
+        if (panel) panel.scrollTop = parseInt(wantScroll[1], 10);
+        else {
+          var v = document.getElementById('view');
+          if (v) v.scrollTop = parseInt(wantScroll[1], 10);
+        }
+      }, 30);
+    }
+  }
+
+  // app.js 在 DOMContentLoaded 上初始化，这里排在它之后执行
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', go);
+  } else {
+    setTimeout(go, 0);
+  }
+})();
+</script>
+</body>
+</html>
